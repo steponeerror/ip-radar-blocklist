@@ -53,6 +53,9 @@ services:
       # 可经 docker inspect 读到容器 env(final-review 裁定:已接受边界;
       # PAT 则永不进容器)。置备步骤见 deploy/README。
       IPRADAR_API_KEY: ${IPRADAR_API_KEY:-}
+      # T8 服务器 trial:2 核 964Mi 引擎吃不住默认 1.1s 配速(≈2300 lookups/s)
+      # → 503 warming,放缓到 2.2s ≈ 570 lookups/s ≈ 1h 全轮,顺带压低 warming 频次。
+      IPRADAR_REQUEST_INTERVAL_S: "2.2"
     volumes:
       # 仓根 rw:产物落这里;推送由宿主机 push.sh 之后执行(不在容器内)
       - ..:/repo

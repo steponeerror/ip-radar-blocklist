@@ -163,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
              f" requests={enrich_stats['requests']}"
              f" retries={enrich_stats['retries']}"
              f" rate_limited={enrich_stats['rate_limited']}"
+             f" warming_waits={enrich_stats['warming_waits']}"
              f" peak_rss_anon_mb={enrich_stats['peak_rss_anon_mb']:.1f}"
              f" elapsed_s={enrich_stats['elapsed_s']:.1f}")
 

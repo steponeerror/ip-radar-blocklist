@@ -24,18 +24,29 @@ seam = the `_SMAPS_ROLLUP_PATH` module constant (monkeypatched to a tmp
 file). Any read/parse failure → warn ONCE on stderr, fall back to the old
 ru_maxrss total. peak_rss_anon_mb = max of per-chunk samples (current
 sampling, not a kernel peak — between-sample spikes are the cgroup's job).
+
+T8 (server-trial finding, 2026-10-03): the 2-core 964Mi server engine
+cannot sustain the default pace and drops into a transient warming state
+(HTTP 503 {"error": {code: "warming"}}) — the generic 5xx backoff (14s
+total) cannot outwait it. 503-warming sleeps 60s and retries the same
+chunk budget-free, capped at 5 warming events per run (then loud abort);
+ANY unreadable/non-JSON 503 body is also treated as warming (one-shot
+nightly — safest interpretation). The pace itself is env-overridable via
+IPRADAR_REQUEST_INTERVAL_S (pure-function parse seam, default 1.1, clamp
+≥ 0.1; the server compose sets 2.2 ≈ 570 lookups/s).
 """
 import json
 import sqlite3
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
-REPO_ROOT = "/home/huxiao/dev/ip-radar-blocklist-pipeline"
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))   # scripts/ as namespace pkg portion
 
 from scripts import consensus_client as cc  # noqa: E402
 
@@ -287,12 +298,14 @@ def test_enrich_fields_headers_anchors_and_stats(db, stub):
                                  None, None, None)
 
     assert set(stats) == {"queried", "malicious", "requests", "retries",
-                          "rate_limited", "peak_rss_anon_mb", "elapsed_s"}
+                          "rate_limited", "warming_waits", "peak_rss_anon_mb",
+                          "elapsed_s"}
     assert stats["queried"] == 4
     assert stats["malicious"] == 2
     assert stats["requests"] == 1
     assert stats["retries"] == 0
     assert stats["rate_limited"] == 0
+    assert stats["warming_waits"] == 0
     assert stats["elapsed_s"] >= 0
 
 
@@ -563,7 +576,7 @@ def test_empty_universe_makes_no_requests(db, stub):
     s = stub(_main_responder)
     stats = cc.enrich_with_consensus(db, s.base)
     assert stats == {"queried": 0, "malicious": 0, "requests": 0,
-                     "retries": 0, "rate_limited": 0,
+                     "retries": 0, "rate_limited": 0, "warming_waits": 0,
                      "peak_rss_anon_mb": 0.0,
                      "elapsed_s": stats["elapsed_s"]}
     assert s.log_bodies == []
@@ -649,3 +662,85 @@ def test_rate_limit_events_over_cap_abort_loudly(db, stub, monkeypatch):
     with pytest.raises(cc.ConsensusStreamError, match="rate-limited"):
         cc.enrich_with_consensus(db, s.base)
     assert len(s.log_bodies) == 11              # 10 次容忍 + 1 次触发中止
+
+
+# ── server-trial fix(T8):503 warming 容忍 + 配速 env 覆写 ──
+
+def test_http_503_warming_waits_60s_retries_same_chunk(db, stub, monkeypatch):
+    """引擎 503 warming(require_ready:X-IPRadar-Reason 头 → 信封 code=
+    "warming")是瞬态:等 60s 后重试同块,不耗 3 次退避预算,统计进
+    warming_waits —— 服务器试跑教训(2 核 964Mi 机被默认配速压进 warming
+    态,通用 5xx 退避 2/4/8s 共 14s 不够耐心)。"""
+    sleeps: list[float] = []                     # 60s 真睡是夜间轮量级
+    monkeypatch.setattr(cc.time, "sleep", sleeps.append)
+    _add_units(db, "203.0.113.7")
+
+    def responder(attempt_no, ips, headers):
+        if attempt_no == 1:
+            return 503, "application/json", _envelope(
+                "warming", "database is warming up")
+        return 200, "application/x-ndjson", _ndjson(
+            _start(ips), _row_evt(0, _row("203.0.113.7", "malicious", 87,
+                                         classifications={"scanner": _cls(
+                                             "scanner", "malicious", True,
+                                             ["dataplane"])})),
+            _done_ok())
+
+    s = stub(responder)
+    stats = cc.enrich_with_consensus(db, s.base)
+
+    assert sleeps == [60.0]                      # 固定 60s warming 等待
+    assert s.log_bodies == [["203.0.113.7"], ["203.0.113.7"]]  # 同块重试
+    assert stats["warming_waits"] == 1
+    assert stats["requests"] == 2                # 同块重试也计请求数
+    assert stats["retries"] == 1                 # 首次之后的尝试(同口径)
+    assert stats["rate_limited"] == 0            # 与 429 计数互不混入
+    assert stats["queried"] == 1                 # 未计永久失败
+    assert _units_by_ip(db)["203.0.113.7"][0] == "malicious"
+
+
+def test_http_503_unreadable_body_treated_as_warming(db, stub, monkeypatch):
+    """正文不可读/非 JSON 的 503 也按 warming 处理:一次性夜间轮,把任何
+    503 当 warming 等待是最安全的解释(宁等勿弃,不误走 14s 预算耗尽)。"""
+    sleeps: list[float] = []
+    monkeypatch.setattr(cc.time, "sleep", sleeps.append)
+    _add_units(db, "203.0.113.7")
+
+    def responder(attempt_no, ips, headers):
+        if attempt_no == 1:
+            return 503, "text/plain", b"<html>gateway melted</html>"
+        return 200, "application/x-ndjson", _ndjson(
+            _start(ips), _row_evt(0, _row("203.0.113.7", "benign", 0)),
+            _done_ok())
+
+    s = stub(responder)
+    stats = cc.enrich_with_consensus(db, s.base)
+
+    assert sleeps == [60.0]
+    assert stats["warming_waits"] == 1
+    assert _units_by_ip(db)["203.0.113.7"][0] == "benign"
+
+
+def test_warming_events_over_cap_abort_loudly(db, stub, monkeypatch):
+    """引擎永不离开 warming:单轮容忍 5 次 warming 等待(5 × 60s),第 6
+    次响亮终止(而非无限等);warming 不耗退避预算,靠事件计数封顶。"""
+    monkeypatch.setattr(cc.time, "sleep", lambda sec: None)
+    _add_units(db, "203.0.113.7")
+    s = stub(lambda n, ips, h: (503, "application/json",
+                                _envelope("warming",
+                                          "database is warming up")))
+
+    with pytest.raises(cc.ConsensusStreamError, match="warming 6 times"):
+        cc.enrich_with_consensus(db, s.base)
+    assert len(s.log_bodies) == 6                # 5 次容忍 + 1 次触发中止
+
+
+def test_request_interval_env_override_parse():
+    """配速 env 解析接缝(纯函数,免 reimport):IPRADAR_REQUEST_INTERVAL_S
+    合法 "2.2" → 2.2;非法/缺失/空 → 默认 1.1;"0.01"/负值 → clamp 0.1。"""
+    assert cc._request_interval_from_env("2.2") == 2.2
+    assert cc._request_interval_from_env("abc") == 1.1
+    assert cc._request_interval_from_env("") == 1.1
+    assert cc._request_interval_from_env(None) == 1.1
+    assert cc._request_interval_from_env("0.01") == 0.1
+    assert cc._request_interval_from_env("-5") == 0.1
