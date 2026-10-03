@@ -34,18 +34,22 @@ docker compose -f deploy/docker-compose.exporter.yml --profile export config -q
 docker network ls | grep ip-lookup-tool
 #   若不同:导出 IPRADAR_NETWORK=<实际网络名>(可写进 unit 的 Environment=)
 
-# 4. 放置 PAT(0600,root;只在宿主机)
+# 4. 核对引擎数据卷存在且非空(默认假定 ip-lookup-tool_ipradar-data)
+docker volume inspect ip-lookup-tool_ipradar-data --format '{{.Mountpoint}}'
+#   必须存在 —— 导出器直接挂这个**命名卷**读 LMDB(不再猜宿主路径);
+#   若引擎 compose 项目名不同,卷全名 = <项目名>_ipradar-data,
+#   导出 IPRADAR_DATA_VOLUME=<实际卷名>(可写进 unit 的 Environment=)
+
+# 5. 放置 PAT(0600,root;只在宿主机)
 umask 077 && install -d /root/.config
 cat > /root/.config/blocklist-push.token    # 粘贴 token,Ctrl-D
 chmod 600 /root/.config/blocklist-push.token
 
-# 5. 试跑一轮(生成 + 推送)
-systemd-run -p Type=oneshot \
-  -p ExecStart=/opt/ip-radar-blocklist/deploy/push.sh …
-#   或直接: docker compose -f deploy/docker-compose.exporter.yml --profile export \
-#             run --rm blocklist-exporter && deploy/push.sh
+# 6. 试跑一轮(生成 + 推送)
+docker compose -f deploy/docker-compose.exporter.yml --profile export \
+  run --rm blocklist-exporter && deploy/push.sh
 
-# 6. 安装并启用 timer
+# 7. 安装并启用 timer
 cp deploy/ipradar-blocklist.service deploy/ipradar-blocklist.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now ipradar-blocklist.timer
@@ -69,9 +73,12 @@ systemctl list-timers ipradar-blocklist.timer   # 核对下次触发点
 
 | 变量 | 默认 | 用途 |
 |---|---|---|
-| `IPRADAR_DATA_DIR` | `/opt/ip-lookup-tool/backend/data` | 引擎 LMDB 数据宿主路径;**同一路径同时作为容器内挂载点**,保证引擎相对路径解析一致 |
-| `IPRADAR_BACKEND_DIR` | `/opt/ip-lookup-tool/backend` | 引擎 backend 只读盖上 `/app/backend`(代码版本与数据同源) |
+| `IPRADAR_DATA_VOLUME` | `ip-lookup-tool_ipradar-data` | 引擎栈的 LMDB 数据**命名卷**全名(`<引擎项目名>_ipradar-data`);导出器以只读方式挂到与引擎容器相同的 `/app/data`,不猜宿主路径 |
 | `IPRADAR_NETWORK` | `ip-lookup-tool_default` | 引擎 compose 项目网络 |
+
+引擎代码与数据路径:导出器复用镜像 `ipradar:latest`,引擎 backend 直接用镜像
+内烤入的 `/app/backend`(引擎 compose 从仓根 context 构建,baked 即权威版本,
+已实机验证 import 走通),不再从宿主 bind 覆盖 —— 与数据卷同理,消除路径猜测。
 
 另:推送 token 可用 env `BLOCKLIST_PUSH_TOKEN` 临时覆盖 token 文件。
 
@@ -86,10 +93,13 @@ systemctl list-timers ipradar-blocklist.timer   # 核对下次触发点
 引擎未起/网络名不对(walk 前连通失败)、RSS 超限(看 `error` 里的阶段)、
 token 失效(push 阶段,ExecStartPost)。
 
+另:开机补跑(Persistent=true)可能赶上引擎容器仍在 60s healthcheck
+start_period 内 —— 首轮 walk 失败属预期,**下一轮 timer 会自愈**,勿慌张干预。
+
 ## 残余风险(如实记录)
 
 - 推送进行中的几秒,内嵌 token 的 URL 出现在 `git push` 进程 `/proc` cmdline
   (默认 Linux 对其他本机用户可读 root 进程 cmdline);单管理员机器已接受,
-  详见 push.sh 内注释。
-- push.sh 的 sed 抹除假设 PAT 无正则元字符(GitHub PAT 满足)。
+  详见 push.sh 内注释。stderr 抹除已改用 perl 从 `%ENV` 读 token(`\Q\E` 原样
+  引用,凭据含正则元字符也安全),抹除器自身 argv 不再携带 token。
 - `git config safe.directory` 仅在 git 拒绝时按需加入,且只加本仓路径。

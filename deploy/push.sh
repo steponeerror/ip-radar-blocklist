@@ -30,33 +30,43 @@ if [ "${#artifacts[@]}" -eq 0 ]; then
 fi
 git add -- "${artifacts[@]}"
 
-if git diff --cached --quiet; then
-    echo "no changes"
-    exit 0
+if ! git diff --cached --quiet; then
+    git -c user.name=ip-radar-exporter -c user.email=noreply@steponeerror \
+        commit -m "nightly export $(date -u +%FT%TZ)"
+else
+    # "no changes" ≠ "无事可做":上一轮可能 commit 后 push 失败,本地欠着
+    # 未推提交,这里裸退 0 会把它们永久困在本地。先看上游(首次运行/空仓
+    # 可能没有 upstream,用 rev-parse 子壳守卫):无上游 = 本地提交全部未推,
+    # 有上游则看 @{u}..HEAD 是否非空 —— 有欠账就继续走下面的推送,真无欠账
+    # 才退出 0。
+    upstream="$(git rev-parse --abbrev-ref '@{u}' 2>/dev/null || true)"
+    if [ -n "$upstream" ] && [ -z "$(git log --oneline '@{u}..HEAD')" ]; then
+        echo "no changes"
+        exit 0
+    fi
+    echo "no new changes but unpushed commits exist — falling through to push" >&2
 fi
 
-git -c user.name=ip-radar-exporter -c user.email=noreply@steponeerror \
-    commit -m "nightly export $(date -u +%FT%TZ)"
-
 # PAT:env 优先(交互覆盖),否则 0600 token 文件;$(...) 自动去尾换行。
-# token 永不 echo、永不落仓库、不写进 .git/config(仅活在下面的进程参数里)。
-TOKEN="${BLOCKLIST_PUSH_TOKEN:-$(cat "$TOKEN_FILE")}"
-if [ -z "$TOKEN" ]; then
-    echo "FATAL: 无推送 token(设 $BLOCKLIST_PUSH_TOKEN 或写 $TOKEN_FILE)" >&2
+# token 永不 echo、永不落仓库、不写进 .git/config;并 export 进本进程环境
+# —— 供下方 perl 从 %ENV 读取做 stderr 抹除(见该处注释)。
+export BLOCKLIST_PUSH_TOKEN="${BLOCKLIST_PUSH_TOKEN:-$(cat "$TOKEN_FILE")}"
+if [ -z "$BLOCKLIST_PUSH_TOKEN" ]; then
+    echo "FATAL: 无推送 token(设 \$BLOCKLIST_PUSH_TOKEN 或写 $TOKEN_FILE)" >&2
     exit 1
 fi
 
 # 残余风险(单管理员机器,已接受,如实记录):
-#  1) 推送进行中的几秒里,内嵌 token 的 URL 出现在 git push 进程的
-#     /proc/<pid>/cmdline —— Linux 默认连 root 进程的 cmdline 也对其他
-#     本机用户可读(hidepid 未开时)。更重的 credential-helper 方案对本
-#     场景过度设计,故按定案取最简安全形态并如实标注。
-#  2) sed 抹除假设 PAT 不含正则元字符 —— GitHub PAT(github_pat_…/40-hex)
-#     均满足;若换成含元字符的凭据,先改这里的转义。
-PUSH_URL="https://x-access-token:${TOKEN}@github.com/steponeerror/ip-radar-blocklist.git"
-git push "$PUSH_URL" main 2>&1 | sed "s/${TOKEN}/***/g"
+#  推送进行中的几秒里,内嵌 token 的 URL 出现在 git push 进程的
+#  /proc/<pid>/cmdline —— Linux 默认连 root 进程的 cmdline 也对其他
+#  本机用户可读(hidepid 未开时)。更重的 credential-helper 方案对本
+#  场景过度设计,故按定案取最简安全形态并如实标注。
+# 抹除器不用 sed(其 argv 会把 token 再次暴露在 /proc cmdline),改用
+# perl 从 %ENV 读 token:\Q\E 原样引用,凭据含正则元字符也安全。
+PUSH_URL="https://x-access-token:${BLOCKLIST_PUSH_TOKEN}@github.com/steponeerror/ip-radar-blocklist.git"
+git push "$PUSH_URL" main 2>&1 | perl -pe 's/\Q$ENV{BLOCKLIST_PUSH_TOKEN}\E/***/g'
 
-unset TOKEN PUSH_URL
+unset BLOCKLIST_PUSH_TOKEN PUSH_URL
 
 # 终态校验:commit+push 后工作树必须干净(.staging/ 已 gitignore 不现身)。
 # 不干净 = 有预期外残留,响亮失败而不是静默吞掉。
