@@ -50,7 +50,7 @@ CREATE TABLE units(
     is_v6 INTEGER NOT NULL,
     is_cidr INTEGER NOT NULL,
     last_seen TEXT,
-    has_first_seen INTEGER NOT NULL DEFAULT 0
+    first_seen TEXT
 )
 """
 CONSENSUS_COLUMNS = ("verdict TEXT", "confidence INTEGER", "classes TEXT",

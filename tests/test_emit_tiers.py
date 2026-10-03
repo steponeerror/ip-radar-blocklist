@@ -30,7 +30,7 @@ CREATE TABLE units(
     is_v6 INTEGER NOT NULL,
     is_cidr INTEGER NOT NULL,
     last_seen TEXT,
-    has_first_seen INTEGER NOT NULL DEFAULT 0,
+    first_seen TEXT,
     verdict TEXT,
     confidence INTEGER,
     classes TEXT,
@@ -56,10 +56,10 @@ EXPECTED_ORDER = [
 
 
 def _insert(conn, ip, *, verdict, is_v6=0, is_cidr=0, last_seen=None,
-            first_seen=0, confidence=None, classes=None, sources=None,
+            first_seen=None, confidence=None, classes=None, sources=None,
             source_count=None, asn=None, country=None):
     conn.execute(
-        "INSERT INTO units(ip, is_v6, is_cidr, last_seen, has_first_seen,"
+        "INSERT INTO units(ip, is_v6, is_cidr, last_seen, first_seen,"
         " verdict, confidence, classes, sources, source_count, asn, country)"
         " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (ip, is_v6, is_cidr, last_seen, first_seen, verdict, confidence,
@@ -71,11 +71,13 @@ def db():
     conn = sqlite3.connect(":memory:")
     conn.execute(UNITS_DDL)
     _insert(conn, "203.0.113.10", verdict="malicious", source_count=4,
-            confidence=80, last_seen="2026-10-05T00:00:00Z", first_seen=1,
+            confidence=80, last_seen="2026-10-05T00:00:00Z",
+            first_seen="2026-10-01T00:00:00Z",
             classes="scanner", sources="srcA;srcB;srcC;srcD",
             asn="AS64512, Example Net", country="US")     # asn 含逗号 → 引号
     _insert(conn, "203.0.113.20", verdict="malicious", source_count=3,
-            confidence=90, last_seen="2026-10-04T00:00:00Z", first_seen=1,
+            confidence=90, last_seen="2026-10-04T00:00:00Z",
+            first_seen="2026-09-20T00:00:00Z",
             classes="bruteforce", sources="srcA;srcB;srcC",
             asn="AS64513", country="DE")
     _insert(conn, "203.0.113.0/24", verdict="malicious", is_cidr=1,
@@ -83,7 +85,8 @@ def db():
             last_seen="2026-10-01T00:00:00Z",
             classes="spam", sources="srcB", asn="AS64514")
     _insert(conn, "203.0.113.40", verdict="malicious", source_count=2,
-            confidence=70, last_seen="2026-10-06T00:00:00Z", first_seen=1,
+            confidence=70, last_seen="2026-10-06T00:00:00Z",
+            first_seen="2026-09-25T00:00:00Z",
             asn="AS64515", country="JP")
     _insert(conn, "203.0.113.50", verdict="malicious", source_count=2,
             confidence=70, last_seen="2026-10-02T00:00:00Z",
@@ -117,21 +120,22 @@ def test_sort_chain_txt_purity_and_csv_verbatim(db, out_dir):
     raw_csv = (out_dir / "top_100.csv").read_bytes()
     assert raw_csv.endswith(b"\n") and b"\r" not in raw_csv
     lines = raw_csv.split(b"\n")
-    # 表头逐字 8 列
+    # 表头逐字 9 列(first_seen 在 sources 与 last_seen 之间)
     assert lines[0] == (b"ip,asn,country,classes,confidence,"
-                        b"source_count,sources,last_seen")
+                        b"source_count,sources,first_seen,last_seen")
     # QUOTE_MINIMAL:asn 含逗号必须加引号(RFC4180)
     assert lines[1] == (b'203.0.113.10,"AS64512, Example Net",US,scanner,'
-                        b'80,4,srcA;srcB;srcC;srcD,2026-10-05T00:00:00Z')
+                        b'80,4,srcA;srcB;srcC;srcD,'
+                        b'2026-10-01T00:00:00Z,2026-10-05T00:00:00Z')
 
     with open(out_dir / "top_100.csv", newline="", encoding="utf-8") as f:
         rows = list(csv.reader(f))
     assert rows[0] == ["ip", "asn", "country", "classes", "confidence",
-                       "source_count", "sources", "last_seen"]
+                       "source_count", "sources", "first_seen", "last_seen"]
     assert [r[0] for r in rows[1:]] == EXPECTED_ORDER
-    # NULL 字段 → 空字符串(m6 的 last_seen/asn/country 皆 NULL)
+    # NULL 字段 → 空字符串(m6 的 first_seen/last_seen/asn/country 皆 NULL)
     m6 = rows[1 + EXPECTED_ORDER.index("203.0.113.60")]
-    assert m6 == ["203.0.113.60", "", "", "", "70", "2", "", ""]
+    assert m6 == ["203.0.113.60", "", "", "", "70", "2", "", "", ""]
 
 
 def test_pool_smaller_than_tiers_up_to_n(db, out_dir):
@@ -167,7 +171,7 @@ def test_manifest_fields_and_file_agreement(db, out_dir):
     assert manifest["malicious_pool"] == 8
     assert manifest["cidr_units"] == 2             # 203.0.113.0/24, 198.51.100.0/24
     assert manifest["units_v6"] == 1               # 2001:db8::1
-    assert manifest["first_seen_coverage"] == pytest.approx(3 / 8)
+    assert manifest["first_seen_coverage"] == pytest.approx(3 / 8)  # 非空占比
     # suspicious/benign 不进任何口径
     assert set(manifest["tiers"].values()) == {8}
     ts = datetime.fromisoformat(manifest["generated_at"])
@@ -201,7 +205,7 @@ def test_empty_pool_zero_byte_txt_and_header_only_csv(out_dir):
         assert (out_dir / f"top_{n}.txt").read_bytes() == b""
         assert (out_dir / f"top_{n}.csv").read_bytes() == (
             b"ip,asn,country,classes,confidence,"
-            b"source_count,sources,last_seen\n")
+            b"source_count,sources,first_seen,last_seen\n")
     assert manifest["malicious_pool"] == 0
     assert manifest["first_seen_coverage"] == 0.0   # 除零守卫
     assert manifest["universe"] == 2

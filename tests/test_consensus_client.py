@@ -37,7 +37,7 @@ CREATE TABLE units(
     is_v6 INTEGER NOT NULL,
     is_cidr INTEGER NOT NULL,
     last_seen TEXT,
-    has_first_seen INTEGER NOT NULL DEFAULT 0,
+    first_seen TEXT,
     verdict TEXT, confidence INTEGER, classes TEXT, sources TEXT,
     source_count INTEGER, asn TEXT, country TEXT
 )

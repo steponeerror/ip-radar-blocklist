@@ -24,10 +24,12 @@ from typing import Any, Iterator
 
 BATCH_SIZE = 500   # 内存红线:executemany 批上限,单元集只存在 sqlite 里
 
-# PRIMARY KEY 冲突合并:last_seen 取 max(NULL 不参与、不覆盖已有值),
-# has_first_seen 取 OR —— 同单元跨源证据只出一行(排序确定性依赖此语义)。
+# PRIMARY KEY 冲突合并:last_seen 取 max、first_seen 取 min(ISO 文本,
+# NULL 不参与比较、也不覆盖已有值),同单元跨源证据只出一行(排序
+# 确定性依赖此语义)。sqlite 标量 min()/max() 是 NULL 中毒的,故用
+# 与 last_seen 同款的 CASE 显式分支。
 _UPSERT = """
-INSERT INTO units(ip, is_v6, is_cidr, last_seen, has_first_seen)
+INSERT INTO units(ip, is_v6, is_cidr, last_seen, first_seen)
 VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(ip) DO UPDATE SET
     last_seen = CASE
@@ -37,7 +39,13 @@ ON CONFLICT(ip) DO UPDATE SET
         THEN excluded.last_seen
         ELSE units.last_seen
     END,
-    has_first_seen = MAX(units.has_first_seen, excluded.has_first_seen)
+    first_seen = CASE
+        WHEN excluded.first_seen IS NOT NULL
+             AND (units.first_seen IS NULL
+                  OR excluded.first_seen < units.first_seen)
+        THEN excluded.first_seen
+        ELSE units.first_seen
+    END
 """
 
 
@@ -75,7 +83,7 @@ def _threat_sources() -> list:
 
 def _iter_records(lmdb_mod, base: Path, is_v6: bool,
                   stats: dict) -> Iterator[tuple]:
-    """Stream one family env → (ip, is_v6, is_cidr, last_seen, has_first_seen).
+    """Stream one family env → (ip, is_v6, is_cidr, last_seen, first_seen).
 
     无 ptr(该族无分片)静默返回;PAYLOADS_NAME 是 payloads 命名库在主库
     键空间的描述符键,不是 [end, evidence] 记录,跳过;int 证据是
@@ -97,16 +105,19 @@ def _iter_records(lmdb_mod, base: Path, is_v6: bool,
             if isinstance(ev, int):
                 ev = lmdb_mod.resolve_evidence(txn, ev, pay_db)
             # 一条记录的证据可能是 dict 或 dict 列表:字段跨列表聚合
+            # (last_seen 取 max、first_seen 取 min,ISO 文本字典序即时间序)
             last_seen: str | None = None
-            has_first_seen = 0
+            first_seen: str | None = None
             for e in (ev if isinstance(ev, list) else [ev]):
                 if not isinstance(e, dict):
                     continue
                 ls = e.get("last_seen")
                 if isinstance(ls, str) and (last_seen is None or ls > last_seen):
-                    last_seen = ls          # ISO 文本,字典序即时间序
-                if e.get("first_seen"):
-                    has_first_seen = 1
+                    last_seen = ls
+                fs = e.get("first_seen")
+                if isinstance(fs, str) and (first_seen is None
+                                            or fs < first_seen):
+                    first_seen = fs
             nets = ipaddress.summarize_address_range(
                 addr_cls(start), addr_cls(end))
             net = next(nets, None)          # 两步探测:恰 1 个才收,免物化
@@ -117,7 +128,7 @@ def _iter_records(lmdb_mod, base: Path, is_v6: bool,
                 text, is_cidr = str(net.network_address), 0
             else:
                 text, is_cidr = str(net), 1
-            yield (text, 1 if is_v6 else 0, is_cidr, last_seen, has_first_seen)
+            yield (text, 1 if is_v6 else 0, is_cidr, last_seen, first_seen)
 
 
 def walk_universe(data_dir: Path, db: sqlite3.Connection, *,
@@ -125,8 +136,8 @@ def walk_universe(data_dir: Path, db: sqlite3.Connection, *,
     """Enumerate the candidate universe into the caller-created units table.
 
     表(调方先建):units(ip TEXT PRIMARY KEY, is_v6 INTEGER NOT NULL,
-    is_cidr INTEGER NOT NULL, last_seen TEXT,
-    has_first_seen INTEGER NOT NULL DEFAULT 0)。
+    is_cidr INTEGER NOT NULL, last_seen TEXT, first_seen TEXT ——
+    该单元全源证据 first_seen 的 min,可空)。
     返回 stats:{"units_total", "units_v4", "units_v6", "cidr_units",
     "per_source", "first_seen_coverage", "skipped_anomalies"}。
     """
@@ -157,7 +168,7 @@ def walk_universe(data_dir: Path, db: sqlite3.Connection, *,
         "units_v6": _count("SELECT COUNT(*) FROM units WHERE is_v6 = 1"),
         "cidr_units": _count("SELECT COUNT(*) FROM units WHERE is_cidr = 1"),
         "first_seen_coverage":
-            _count("SELECT COUNT(*) FROM units WHERE has_first_seen = 1")
+            _count("SELECT COUNT(*) FROM units WHERE first_seen IS NOT NULL")
             / total if total else 0.0,
     })
     return stats

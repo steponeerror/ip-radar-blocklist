@@ -19,7 +19,7 @@ ip-radar(44 源聚合威胁情报引擎)的**每日黑名单导出**:对全部�
 | 文件 | 内容 |
 |---|---|
 | `top_N.txt` | 纯数据行:每行一个单元(IP 或 CIDR 原文),无表头无注释,UTF-8、LF、EOF 恰一换行 —— `ipset restore` / `iptables-restore` 直吃 |
-| `top_N.csv` | 表头逐字 8 列:`ip,asn,country,classes,confidence,source_count,sources,last_seen`(RFC4180 引号规则) |
+| `top_N.csv` | 表头逐字 9 列:`ip,asn,country,classes,confidence,source_count,sources,first_seen,last_seen`(RFC4180 引号规则) |
 | `manifest.json` | 本轮元数据(字段见下);失败时为 error manifest |
 
 - N ∈ {100, 500, 1000, 5000, 10000},**嵌套超集**:所有档位出自同一排序
@@ -31,7 +31,7 @@ ip-radar(44 源聚合威胁情报引擎)的**每日黑名单导出**:对全部�
 
 | # | 裁决 |
 |---|---|
-| 1 | schema 8 列:`ip,asn,country,classes,confidence,source_count,sources,last_seen`;无 `first_seen` 列(覆盖率进 manifest) |
+| 1 | schema 9 列:`ip,asn,country,classes,confidence,source_count,sources,first_seen,last_seen`;`first_seen` = 该单元全源证据 first_seen 的 min(walk 阶段按 ISO 文本比较)。(2026-10-03 Q5-B 逆转条款生效:run #1 实测恶意池 first_seen 覆盖率 41.5%,列于首次公开发布前加回) |
 | 2 | 排序:`source_count DESC → confidence DESC → last_seen DESC NULLS LAST → ip ASC`(末键保跨轮确定性) |
 | 3 | 档位恒存在,up to N(行数即真实数,不虚补不缺席) |
 | 4 | v4/v6 混装单文件,不拆族 |
@@ -114,7 +114,7 @@ timer 每日触发 `docker compose run --rm blocklist-exporter`,产物落仓目�
 | `universe` | walk 枚举到的候选单元总数 |
 | `malicious_pool` | verdict=="malicious" 的池大小 |
 | `cidr_units` / `units_v6` | 池内 CIDR / v6 单元数 |
-| `first_seen_coverage` | 池内 has_first_seen 比例 |
+| `first_seen_coverage` | 恶意池内 `first_seen` 非空占比 |
 | `walk_stats` | T1 统计(units_total/units_v4/units_v6/cidr_units/per_source/first_seen_coverage/skipped_anomalies) |
 | `enrich_stats` | T2 统计(queried/malicious/requests/retries/rate_limited/elapsed_s) |
 | `elapsed_s` | 全管线耗时(秒) |

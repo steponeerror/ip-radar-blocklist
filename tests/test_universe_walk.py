@@ -28,7 +28,7 @@ CREATE TABLE units(
     is_v6 INTEGER NOT NULL,
     is_cidr INTEGER NOT NULL,
     last_seen TEXT,
-    has_first_seen INTEGER NOT NULL DEFAULT 0
+    first_seen TEXT
 )
 """
 
@@ -71,7 +71,7 @@ def _build_turris(data_dir: Path, rows: list[str]):
 
 def _units_rows(conn: sqlite3.Connection) -> dict:
     return {r[0]: tuple(r[1:]) for r in conn.execute(
-        "SELECT ip, is_v6, is_cidr, last_seen, has_first_seen FROM units")}
+        "SELECT ip, is_v6, is_cidr, last_seen, first_seen FROM units")}
 
 
 def test_walk_v4_v6_cidr_merge_and_stats(data_dir, db, monkeypatch):
@@ -95,19 +95,25 @@ def test_walk_v4_v6_cidr_merge_and_stats(data_dir, db, monkeypatch):
                                         engine_path=ENGINE_BACKEND)
 
     rows = _units_rows(db)
-    # /32 and /128 units are written as plain IP text (no /32 suffix)
-    assert rows["203.0.113.5"] == (0, 0, "2026-10-01T00:00:00Z", 1)
-    assert rows["203.0.113.99"] == (0, 0, "2026-10-02T00:00:00Z", 1)
-    # evidence list on one record: last_seen = max, first_seen present
-    assert rows["203.0.113.7"] == (0, 0, "2026-10-05T00:00:00Z", 1)
+    # /32 and /128 units are written as plain IP text (no /32 suffix);
+    # dataplane double-fills first_seen = last_seen on every row
+    assert rows["203.0.113.5"] == (0, 0, "2026-10-01T00:00:00Z",
+                                   "2026-10-01T00:00:00Z")
+    assert rows["203.0.113.99"] == (0, 0, "2026-10-02T00:00:00Z",
+                                    "2026-10-02T00:00:00Z")
+    # evidence list on one record: last_seen = max, first_seen = MIN
+    assert rows["203.0.113.7"] == (0, 0, "2026-10-05T00:00:00Z",
+                                   "2026-09-25T00:00:00Z")
     # v6 /128 → plain compressed v6 text
-    assert rows["2001:db8::1"] == (1, 0, "2026-10-03T00:00:00Z", 1)
+    assert rows["2001:db8::1"] == (1, 0, "2026-10-03T00:00:00Z",
+                                   "2026-10-03T00:00:00Z")
     # CIDR units keep CIDR text (v6 compressed); turris rows carry no
-    # last_seen/first_seen → NULL / 0
-    assert rows["198.51.100.0/24"] == (0, 1, None, 0)
-    assert rows["2001:db8:aaaa::/48"] == (1, 1, None, 0)
+    # last_seen/first_seen → NULL / NULL
+    assert rows["198.51.100.0/24"] == (0, 1, None, None)
+    assert rows["2001:db8:aaaa::/48"] == (1, 1, None, None)
     # cross-source merge: turris re-insert of 203.0.113.5 must NOT clobber
-    # dataplane's last_seen/has_first_seen (max / OR merge, not overwrite)
+    # dataplane's last_seen/first_seen (max / min merge, not overwrite —
+    # NULL 既不参与比较也不覆盖已有值)
     assert len(rows) == 6
 
     assert stats["units_total"] == 6
@@ -156,7 +162,65 @@ def test_walk_skips_misaligned_range_anomaly(data_dir, db, monkeypatch):
 
     assert stats["skipped_anomalies"] == 1
     assert stats["units_total"] == 1
-    assert _units_rows(db) == {"192.0.2.7": (0, 0, None, 0)}
+    assert _units_rows(db) == {"192.0.2.7": (0, 0, None, None)}
+
+
+def test_walk_first_seen_min_and_null_safe_cross_source_merge(
+        data_dir, db, monkeypatch):
+    """Hand-built shards (anomaly-test 手法) pin the first_seen merge
+    semantics across sources: min 换入、min 保持、NULL 不参与也不被覆盖。"""
+    import lmdb
+    from ipdb._sources._lmdb import encode_key, encode_value
+
+    class StubFeed:
+        category = "threat"
+        classification_type = "scanner"
+
+        def __init__(self, d: Path, name: str):
+            self.name = name
+            self._lmdb_base = d / f"{name}.txt.lmdb"
+            self._lmdb6_base = d / f"{name}.txt.v6.lmdb"   # no ptr → skip
+
+        def build(self, records):       # (ip, evidence dict),全 /32
+            base = self._lmdb_base
+            env = lmdb.open(str(base.parent / f"{base.name}.1"), subdir=True,
+                            map_size=1 << 20, max_dbs=2)
+            with env.begin(write=True) as txn:
+                for ip, ev in records:
+                    n = int(ipaddress.IPv4Address(ip))
+                    txn.put(encode_key(n), encode_value(n, ev))
+            env.sync(True)
+            env.close()
+            (base.parent / (base.name + ".ptr")).write_text("1\n",
+                                                             encoding="utf-8")
+            return self
+
+    ev = {"classification_type": "scanner", "verdict": "malicious"}
+    feed_a = StubFeed(data_dir, "feeda").build([
+        ("198.51.100.10", {**ev, "first_seen": "2026-09-01T00:00:00Z"}),
+        ("198.51.100.11", dict(ev)),                    # first_seen = NULL
+        ("198.51.100.12", {**ev, "first_seen": "2026-08-01T00:00:00Z"}),
+    ])
+    feed_b = StubFeed(data_dir, "feedb").build([
+        ("198.51.100.10", {**ev, "first_seen": "2026-08-01T00:00:00Z"}),
+        ("198.51.100.11", {**ev, "first_seen": "2026-08-15T00:00:00Z"}),
+        ("198.51.100.12", {**ev, "first_seen": "2026-09-01T00:00:00Z"}),
+    ])
+    monkeypatch.setattr(universe_walk, "_threat_sources",
+                        lambda: [feed_a, feed_b])
+
+    stats = universe_walk.walk_universe(data_dir, db,
+                                        engine_path=ENGINE_BACKEND)
+
+    rows = _units_rows(db)
+    # .10: 09-01 先入库,08-01 后到 → min 换入(新值更小,替换)
+    assert rows["198.51.100.10"] == (0, 0, None, "2026-08-01T00:00:00Z")
+    # .11: NULL 先入库,值后到 → 值存活(NULL 不参与、不覆盖)
+    assert rows["198.51.100.11"] == (0, 0, None, "2026-08-15T00:00:00Z")
+    # .12: 08-01 先入库,09-01 后到 → min 保持(新值更大,不替换)
+    assert rows["198.51.100.12"] == (0, 0, None, "2026-08-01T00:00:00Z")
+    assert stats["units_total"] == 3
+    assert stats["first_seen_coverage"] == 1.0   # 全宇宙口径,3/3 非空
 
 
 def test_walk_no_shard_and_empty_universe(data_dir, db, monkeypatch):

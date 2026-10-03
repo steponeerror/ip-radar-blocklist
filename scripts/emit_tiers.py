@@ -27,9 +27,10 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-# CSV 8 列表头逐字(Global Constraints);SELECT 列序与之一一对应
+# CSV 9 列表头逐字(Global Constraints;first_seen 在 sources 与
+# last_seen 之间);SELECT 列序与之一一对应
 CSV_HEADER = ("ip", "asn", "country", "classes", "confidence",
-              "source_count", "sources", "last_seen")
+              "source_count", "sources", "first_seen", "last_seen")
 
 # 单条排序 SQL(Q2-B):source_count DESC → confidence DESC →
 # last_seen NULLS LAST(SQLite 无 NULLS LAST 关键字,`last_seen IS NULL`
@@ -54,10 +55,10 @@ def _scalar(db: sqlite3.Connection, sql: str) -> int:
     return db.execute(sql).fetchone()[0]
 
 
-def _pool_flag_count(db: sqlite3.Connection, column: str) -> int:
-    """恶意池内旗标计数(column 仅来自本模块字面量,非外部输入)。"""
+def _pool_count(db: sqlite3.Connection, cond: str) -> int:
+    """恶意池内计数(cond 仅来自本模块字面量,非外部输入)。"""
     return _scalar(db, f"SELECT COUNT(*) FROM units"
-                       f" WHERE verdict = 'malicious' AND {column} = 1")
+                       f" WHERE verdict = 'malicious' AND ({cond})")
 
 
 def _write_tier(db: sqlite3.Connection, txt_path: Path, csv_path: Path,
@@ -65,7 +66,7 @@ def _write_tier(db: sqlite3.Connection, txt_path: Path, csv_path: Path,
     """Stream the LIMIT-n sorted cursor → txt + csv. Returns rows written.
 
     txt:每行 ip 列原文(CIDR/v6 混装),无表头无注释,行尾 LF、EOF 恰一
-    换行;csv:表头逐字 8 列,QUOTE_MINIMAL(逗号字段自动引),NULL → ""。
+    换行;csv:表头逐字 9 列,QUOTE_MINIMAL(逗号字段自动引),NULL → ""。
     """
     rows = 0
     with open(txt_path, "w", encoding="utf-8", newline="\n") as tf, \
@@ -121,10 +122,10 @@ def emit_tiers(db: sqlite3.Connection, out_dir: Path, *,
         "tiers": {},
         "universe": _scalar(db, "SELECT COUNT(*) FROM units"),
         "malicious_pool": pool,
-        "cidr_units": _pool_flag_count(db, "is_cidr"),
-        "units_v6": _pool_flag_count(db, "is_v6"),
-        "first_seen_coverage": _pool_flag_count(db, "has_first_seen")
-        / pool if pool else 0.0,
+        "cidr_units": _pool_count(db, "is_cidr = 1"),
+        "units_v6": _pool_count(db, "is_v6 = 1"),
+        "first_seen_coverage": _pool_count(
+            db, "first_seen IS NOT NULL") / pool if pool else 0.0,
     }
 
     # 流式写档:每档一条 LIMIT 游标,行到即写,池从不物化
