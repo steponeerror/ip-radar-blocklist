@@ -8,7 +8,9 @@ fields back (executemany, commit per chunk — the WHERE filter makes paging
 advance monotonically). Memory redline: NDJSON responses are consumed LINE
 BY LINE straight off the socket; the only Python-side accumulation is the
 ≤chunk update batch that executemany requires anyway. After every chunk the
-process RSS is self-checked — 爆顶死任务不死机器.
+process's ANONYMOUS RSS is self-checked (smaps_rollup `Anonymous:` line,
+ru_maxrss fallback; T7 — ru_maxrss total conflates reclaimable mmap file
+pages with real allocation) — 爆顶死任务不死机器.
 
 Engine API contract (pinned against backend/main.py query_ips_stream →
 _stream_lookup, 2026-10-03): POST {base}/api/query/stream, body
@@ -67,9 +69,16 @@ _RETRY_AFTER_FALLBACK_S = 30.0     # 429 信封缺 retry_after 时的兜底等�
 _UPDATE_SQL = ("UPDATE units SET verdict=?, confidence=?, classes=?,"
                " sources=?, source_count=?, asn=?, country=? WHERE ip=?")
 
+# T7 自检指标源:匿名内存。ru_maxrss 总量把 LMDB 走读留下的可回收 mmap
+# 文件页(run #1 峰值 169MB 的大头,内核在 cgroup 顶下回收)也算进去,
+# 会误杀;路径常量即测试注入接缝。
+_SMAPS_ROLLUP_PATH = "/proc/self/smaps_rollup"
+_anon_rss_fallback_warned = False          # 回退告警每进程只发一次
+
 
 class MemoryBudgetExceeded(RuntimeError):
-    """ru_maxrss 自检超过 --max-rss-mb 预算(每块处理后检查)。"""
+    """匿名 RSS 自检超过 --max-rss-mb 预算(每块处理后检查;口径见
+    _current_anon_rss_mb)。"""
 
 
 class ConsensusStreamError(RuntimeError):
@@ -89,6 +98,29 @@ def _current_rss_mb() -> float:
     """ru_maxrss → MB(Linux 单位 KB,macOS 单位字节)。"""
     kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return kb / (1024 * 1024) if sys.platform == "darwin" else kb / 1024
+
+
+def _current_anon_rss_mb() -> float:
+    """匿名 RSS(MB):smaps_rollup 的 `Anonymous:` 行(kB → MB)。
+
+    红线口径(T7):这是**当前采样值**,非内核维护峰值 —— 采样间隔间的
+    尖峰是 cgroup 硬顶(mem_limit 150m)的职责。任何读取/解析失败(文件
+    缺、行缺、值非整数)→ stderr 告警一次后回退 ru_maxrss 总量(旧口径,
+    _current_rss_mb):指标降级响亮,绝不崩溃。"""
+    global _anon_rss_fallback_warned
+    try:
+        with open(_SMAPS_ROLLUP_PATH, encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("Anonymous:"):
+                    return int(line.split()[1]) / 1024
+    except (OSError, ValueError, IndexError):
+        pass                                   # 缺文件/缺行/非整数 → 回退
+    if not _anon_rss_fallback_warned:
+        _anon_rss_fallback_warned = True
+        print(f"[consensus] WARNING: cannot parse Anonymous from"
+              f" {_SMAPS_ROLLUP_PATH} — anon-RSS self-check falls back to"
+              f" ru_maxrss total", file=sys.stderr, flush=True)
+    return _current_rss_mb()
 
 
 def _merged_str(row: dict, field: str) -> str:
@@ -297,12 +329,15 @@ def enrich_with_consensus(db: sqlite3.Connection, api_base: str, *,
     chunks drop out of the filter, so the cursor advances monotonically and
     a rerun resumes from the first unprocessed unit. chunk 默认 2500(smoke
     宇宙 ~3.5M 单元 → ~1400 块 × 1.1s 配速 ≈ 26 min;内存仍有界:在飞
-    ≤2500 行 ≈ 几 MB)。返回 stats:{"queried", "malicious", "requests",
-    "retries", "rate_limited", "elapsed_s"}。
+    ≤2500 行 ≈ 几 MB)。max_rss_mb 是匿名内存红线(T7 口径:
+    smaps_rollup `Anonymous:`,解析失败回退 ru_maxrss 并告警一次),默认
+    140。返回 stats:{"queried", "malicious", "requests", "retries",
+    "rate_limited", "peak_rss_anon_mb", "elapsed_s"} — peak_rss_anon_mb
+    是逐块匿名采样的最大值(当前采样,非内核峰值)。
     """
     url = api_base.rstrip("/") + _STREAM_PATH
     stats: dict = {"queried": 0, "malicious": 0, "requests": 0,
-                   "retries": 0, "rate_limited": 0}
+                   "retries": 0, "rate_limited": 0, "peak_rss_anon_mb": 0.0}
     pacer = _RequestPacer()
     started = time.monotonic()
     while True:
@@ -318,9 +353,11 @@ def enrich_with_consensus(db: sqlite3.Connection, api_base: str, *,
         db.commit()                                # 块粒度提交:分页单调推进
         stats["queried"] += len(units)
         stats["malicious"] += sum(1 for u in updates if u[0] == "malicious")
-        if _current_rss_mb() > max_rss_mb:
+        anon_mb = _current_anon_rss_mb()
+        stats["peak_rss_anon_mb"] = max(stats["peak_rss_anon_mb"], anon_mb)
+        if anon_mb > max_rss_mb:
             raise MemoryBudgetExceeded(
-                f"RSS {_current_rss_mb():.1f}MB exceeds budget"
+                f"anon RSS {anon_mb:.1f}MB exceeds budget"
                 f" {max_rss_mb}MB")
     stats["elapsed_s"] = time.monotonic() - started
     return stats

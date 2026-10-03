@@ -87,7 +87,8 @@ systemctl list-timers ipradar-blocklist.timer   # 核对下次触发点
 
 - 服务器总内存 964Mi,常驻仅 ~124Mi 可用;引擎栈(ipradar + caddy)必须优先活。
 - 容器 `mem_limit: 150m` 是 cgroup 硬顶,兜在管线自身 `--max-rss-mb 140`
-  (ru_maxrss 自检、超限主动终止)之外作机器保险:**fail-small —— 爆顶只死
+  (匿名 RSS 自检、超限主动终止;自检口径见仓 README「内存红线与失败
+  语义」)之外作机器保险:**fail-small —— 爆顶只死
   导出器,绝不拖垮引擎**。
 - `restart: "no"`:一次性日任务。卡死的导出器自旋重启只会反复烧 CPU/内存;
   死了就等下一轮 timer。systemd 侧 `TimeoutStartSec=2h` 同理是守门,非预期
@@ -110,7 +111,8 @@ systemctl list-timers ipradar-blocklist.timer   # 核对下次触发点
 ## 运维读 manifest.json
 
 成功轮:`generated_at` / `tiers`(每档实际行数)/ `malicious_pool` /
-`peak_rss_mb` / `elapsed_s` / `api_base`,以及 `walk_stats`、`enrich_stats`。
+`peak_rss_mb`(ru_maxrss 总量,仅观测)/ `peak_rss_anon_mb`(红线口径) /
+`elapsed_s` / `api_base`,以及 `walk_stats`、`enrich_stats`。
 **失败轮:`error` 键出现即本轮失败**(带 `[阶段]` 前缀),此时 systemd 单元
 为 failed、**未推送**;档位文件保持上一成功轮原样。处理:
 `journalctl -u ipradar-blocklist.service` 看容器 stderr 进度行定位阶段,

@@ -73,7 +73,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--out-dir", type=Path, default=_REPO_ROOT,
                    help="artifact directory (default: repo root)")
     p.add_argument("--max-rss-mb", type=int, default=140,
-                   help="ru_maxrss budget in MB; exceeding aborts the run "
+                   help="anonymous-RSS budget in MB (smaps_rollup "
+                        "`Anonymous:` line; unreadable -> ru_maxrss total "
+                        "fallback with a warning); exceeding aborts the run "
                         "(default: 140)")
     p.add_argument("--api-key", default=os.environ.get("IPRADAR_API_KEY"),
                    help="engine API key, sent as 'Authorization: Bearer' on "
@@ -161,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
              f" requests={enrich_stats['requests']}"
              f" retries={enrich_stats['retries']}"
              f" rate_limited={enrich_stats['rate_limited']}"
+             f" peak_rss_anon_mb={enrich_stats['peak_rss_anon_mb']:.1f}"
              f" elapsed_s={enrich_stats['elapsed_s']:.1f}")
 
         stage = "emit"
@@ -180,7 +183,12 @@ def main(argv: list[str] | None = None) -> int:
             "walk_stats": walk_stats,
             "enrich_stats": enrich_stats,
             "elapsed_s": round(time.monotonic() - started, 3),
+            # 双口径峰值(T7):peak_rss_mb = ru_maxrss 总量(含可回收 mmap
+            # 文件页,仅观测);peak_rss_anon_mb = enrich 逐块匿名采样峰值
+            # (--max-rss-mb 红线口径;当前采样非内核峰值,间隔尖峰归 cgroup)。
             "peak_rss_mb": round(consensus_client._current_rss_mb(), 1),
+            "peak_rss_anon_mb": round(
+                enrich_stats.get("peak_rss_anon_mb", 0.0), 1),
             "api_base": args.api_base,
         })
         tmp = out_dir / "manifest.json.tmp"

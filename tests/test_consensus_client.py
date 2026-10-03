@@ -15,6 +15,15 @@ Auth/pacing/429 tolerance (final-review P1 fix): api_key → every request
 else 401); request starts are paced ≥ MIN_REQUEST_INTERVAL_S; HTTP 429 is
 transient — sleep the envelope's retry_after, retry the same chunk without
 consuming the attempt budget, abort loudly past 10 rate-limit events per run.
+
+T7 (self-check metric): the per-chunk budget check measures ANONYMOUS RSS
+(/proc/self/smaps_rollup `Anonymous:` line, kB → MB) — ru_maxrss total
+conflates reclaimable mmap file pages (run #1: most of 169MB peak) with real
+allocation and would false-abort under the server's 150m cgroup. Injection
+seam = the `_SMAPS_ROLLUP_PATH` module constant (monkeypatched to a tmp
+file). Any read/parse failure → warn ONCE on stderr, fall back to the old
+ru_maxrss total. peak_rss_anon_mb = max of per-chunk samples (current
+sampling, not a kernel peak — between-sample spikes are the cgroup's job).
 """
 import json
 import sqlite3
@@ -278,7 +287,7 @@ def test_enrich_fields_headers_anchors_and_stats(db, stub):
                                  None, None, None)
 
     assert set(stats) == {"queried", "malicious", "requests", "retries",
-                          "rate_limited", "elapsed_s"}
+                          "rate_limited", "peak_rss_anon_mb", "elapsed_s"}
     assert stats["queried"] == 4
     assert stats["malicious"] == 2
     assert stats["requests"] == 1
@@ -425,8 +434,19 @@ def test_http_4xx_raises_immediately_without_retry(db, stub):
     assert len(s.log_bodies) == 1       # 4xx 是永久错,不重试
 
 
-def test_memory_budget_exceeded_after_chunk(db, stub, monkeypatch):
-    monkeypatch.setattr(cc, "_current_rss_mb", lambda: 999.0)
+# ── T7:匿名 RSS 自检(smaps_rollup Anonymous;路径常量即注入接缝)──
+
+def _smaps_inject(monkeypatch, tmp_path, anon_kb):
+    """伪 /proc/self/smaps_rollup:Anonymous 值自由设定(kB)。"""
+    p = tmp_path / "smaps_rollup"
+    p.write_text(f"Rss: {anon_kb + 4096} kB\n"
+                 f"Anonymous: {anon_kb} kB\n", encoding="ascii")
+    monkeypatch.setattr(cc, "_SMAPS_ROLLUP_PATH", str(p))
+    return p
+
+
+def test_memory_budget_exceeded_after_chunk(db, stub, monkeypatch, tmp_path):
+    _smaps_inject(monkeypatch, tmp_path, 1022976)       # 999 MB 匿名
     _add_units(db, "203.0.113.7", "198.51.100.5", "192.0.2.1", "2001:db8::1")
 
     def responder(attempt_no, ips, headers):
@@ -437,7 +457,7 @@ def test_memory_budget_exceeded_after_chunk(db, stub, monkeypatch):
         return 200, "application/x-ndjson", _ndjson(*events)
 
     s = stub(responder)
-    with pytest.raises(cc.MemoryBudgetExceeded, match="140"):
+    with pytest.raises(cc.MemoryBudgetExceeded, match="anon.*140"):
         cc.enrich_with_consensus(db, s.base, chunk=2, max_rss_mb=140)
     # 第一块已提交,第二块未发 —— 爆顶即停,不多发一个请求
     rows = _units_by_ip(db)
@@ -445,6 +465,75 @@ def test_memory_budget_exceeded_after_chunk(db, stub, monkeypatch):
     assert rows["198.51.100.5"][0] == "benign"
     assert rows["192.0.2.1"][0] is None
     assert len(s.log_bodies) == 1
+
+
+def test_current_anon_rss_mb_parses_anonymous_line(monkeypatch, tmp_path):
+    _smaps_inject(monkeypatch, tmp_path, 20480)         # 20 MB
+    assert cc._current_anon_rss_mb() == 20.0
+
+
+def test_current_anon_rss_mb_parse_failure_falls_back_warns_once(
+        monkeypatch, tmp_path, capsys):
+    """任何读取/解析失败(缺文件/缺 Anonymous 行/值非整数)→ 三者都回退
+    ru_maxrss 口径,stderr 恰好告警一次(单进程只喊一嗓子),不抛异常。"""
+    monkeypatch.setattr(cc, "_current_rss_mb", lambda: 123.0)
+    monkeypatch.setattr(cc, "_anon_rss_fallback_warned", False)
+    missing = tmp_path / "nope"                          # 文件不存在
+    no_line = tmp_path / "no_anon_line"                  # 缺 Anonymous 行
+    no_line.write_text("Rss: 100 kB\n", encoding="ascii")
+    bad_value = tmp_path / "non_integer"                 # 值非整数
+    bad_value.write_text("Anonymous: abc kB\n", encoding="ascii")
+    for path in (missing, no_line, bad_value):
+        monkeypatch.setattr(cc, "_SMAPS_ROLLUP_PATH", str(path))
+        assert cc._current_anon_rss_mb() == 123.0        # 全部回退,不抛
+    assert capsys.readouterr().err.count("WARNING") == 1
+
+
+def test_under_threshold_anon_passes_and_peak_recorded(db, stub, monkeypatch,
+                                                       tmp_path):
+    _smaps_inject(monkeypatch, tmp_path, 51200)          # 50 MB < 140
+    _add_units(db, "203.0.113.7")
+
+    s = stub(_benign_responder)
+    stats = cc.enrich_with_consensus(db, s.base, max_rss_mb=140)
+
+    assert stats["peak_rss_anon_mb"] == 50.0
+    assert _units_by_ip(db)["203.0.113.7"][0] == "benign"
+
+
+def test_peak_rss_anon_mb_tracks_max_sample(db, stub, monkeypatch, tmp_path):
+    """峰值 = 各块采样的 max(当前采样,非内核维护峰值)。responder 在
+    服务端逐请求改写伪 smaps,块后自检读到的采样值随之变化。"""
+    p = _smaps_inject(monkeypatch, tmp_path, 10240)      # 初始 10 MB
+    samples_kb = (10240, 30720, 20480)                   # 10 → 30 → 20 MB
+    _add_units(db, "203.0.113.7", "198.51.100.5", "192.0.2.1")
+
+    def responder(attempt_no, ips, headers):
+        p.write_text(f"Anonymous: {samples_kb[attempt_no - 1]} kB\n",
+                     encoding="ascii")
+        return _benign_responder(attempt_no, ips, headers)
+
+    s = stub(responder)
+    stats = cc.enrich_with_consensus(db, s.base, chunk=1, max_rss_mb=140)
+
+    assert [len(b) for b in s.log_bodies] == [1, 1, 1]   # 三块各一请求
+    assert stats["peak_rss_anon_mb"] == 30.0             # 取采样最大值
+
+
+def test_enrich_unreadable_smaps_falls_back_to_ru_maxrss(
+        db, stub, monkeypatch, tmp_path, capsys):
+    """整轮跑在不可读 smaps 上:逐块回退 ru_maxrss 值且只告警一次,
+    不抛异常 —— 指标口径降级响亮,红线本身照常运转。"""
+    monkeypatch.setattr(cc, "_SMAPS_ROLLUP_PATH", str(tmp_path / "nope"))
+    monkeypatch.setattr(cc, "_current_rss_mb", lambda: 123.0)
+    monkeypatch.setattr(cc, "_anon_rss_fallback_warned", False)
+    _add_units(db, "203.0.113.7", "198.51.100.5")
+
+    s = stub(_benign_responder)
+    stats = cc.enrich_with_consensus(db, s.base, chunk=1, max_rss_mb=140)
+
+    assert stats["peak_rss_anon_mb"] == 123.0            # 回退值参与峰值
+    assert capsys.readouterr().err.count("WARNING") == 1  # 两块只喊一次
 
 
 def test_chunked_pagination_and_v6_units(db, stub):
@@ -475,6 +564,7 @@ def test_empty_universe_makes_no_requests(db, stub):
     stats = cc.enrich_with_consensus(db, s.base)
     assert stats == {"queried": 0, "malicious": 0, "requests": 0,
                      "retries": 0, "rate_limited": 0,
+                     "peak_rss_anon_mb": 0.0,
                      "elapsed_s": stats["elapsed_s"]}
     assert s.log_bodies == []
 

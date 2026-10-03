@@ -245,7 +245,7 @@ def test_cli_end_to_end_publishes_tiers_and_merged_manifest(
     for field in ("generated_at", "tiers", "universe", "malicious_pool",
                   "cidr_units", "units_v6", "first_seen_coverage",
                   "walk_stats", "enrich_stats", "elapsed_s", "peak_rss_mb",
-                  "api_base"):
+                  "peak_rss_anon_mb", "api_base"):
         assert field in manifest, field
     assert manifest["universe"] == 7
     assert manifest["malicious_pool"] == 4
@@ -266,6 +266,9 @@ def test_cli_end_to_end_publishes_tiers_and_merged_manifest(
     assert manifest["api_base"] == s.base
     assert manifest["elapsed_s"] > 0
     assert manifest["peak_rss_mb"] > 0
+    # T7:匿名口径峰值随 enrich 采样进 manifest(enrich_stats 内同名字段)
+    assert manifest["peak_rss_anon_mb"] > 0
+    assert manifest["enrich_stats"]["peak_rss_anon_mb"] > 0
 
     # 单次整批请求(7 单位 < chunk 2500),锚点形态(CIDR 剥前缀、v6 原样);
     # 批内顺序是 LMDB 键序(游标枚举),契约只钉集合不钉顺序

@@ -16,8 +16,8 @@
 # 容器会启动 API 服务而非导出。
 #
 # 内存:服务器共 964Mi(常驻仅 ~124Mi 可用)。150m 是 cgroup 硬顶,
-# 兜在 CLI 自身 --max-rss-mb 140(ru_maxrss 自检)之外作机器保险;
-# fail-small 原则:爆顶只死导出器,绝不拖垮引擎。restart: "no"——
+# 兜在 CLI 自身 --max-rss-mb 140(匿名 RSS 自检,见仓 README 内存红线)
+# 之外作机器保险;fail-small 原则:爆顶只死导出器,绝不拖垮引擎。restart: "no"——
 # 一次性日任务,卡死的导出器绝不能自旋,等下一轮 timer 即可。
 
 name: ipradar-blocklist

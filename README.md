@@ -45,7 +45,7 @@ ip-radar(44 源聚合威胁情报引擎)的**每日黑名单导出**:对全部�
 | 12 | 发布形态:每日 commit 到 main |
 | 13 | 失败语义:产物先写 `.staging/`(gitignored),校验后逐文件原子 `os.replace` 换入,`manifest.json` **最后落**(消费者可见提交点);失败只写带 `error` 的 manifest.json,**保留前次产物原封不动** |
 | 14 | API 契约:`POST /api/query/stream`,body `{"ips": [...]}`,NDJSON 流响应;每请求带 `x-ipradar-client: web` 头 + `Authorization: Bearer <key>`(引擎查询端点强制 key 鉴权,非同源无 key 即 401;key 经 `--api-key`/env `IPRADAR_API_KEY` 传入,置备见 deploy/README);请求起点配速 ≥1.1s(引擎 keyed 限流 60/min);429 按错误信封 `retry_after` 等待后重试同块(不耗重试预算,单轮 ≤10 次,超出响亮终止);每块 3 次指数退避(2/4/8s)重试后仍失败 → 整轮终止 |
-| 15 | 内存红线:全程流式 + sqlite 为唯一中间态,分块 ≤2500(在飞仅几 MB),进程 `ru_maxrss` 自检(默认 140MB)超限主动终止 —— **爆顶死任务不死机器** |
+| 15 | 内存红线:全程流式 + sqlite 为唯一中间态,分块 ≤2500(在飞仅几 MB),进程**匿名内存**自检(smaps_rollup `Anonymous:` 行,默认 140MB;任何读取/解析失败 → 告警一次并回退 `ru_maxrss` 总量)超限主动终止 —— **爆顶死任务不死机器**。`ru_maxrss` 总量(含可回收 mmap 文件页,run #1 实测 169MB 峰值的大头是这类页)只入 manifest `peak_rss_mb` 作观测,不作红线 |
 
 ## 运行手册
 
@@ -100,6 +100,13 @@ timer 每日触发 `docker compose run --rm blocklist-exporter`,产物落仓目�
 
 - 三段全流式:LMDB 游标枚举(executemany ≤2500/批)、NDJSON 逐行消费、
   sqlite 游标直写档位文件;单元集合从不物化进 Python list/dict。
+- 自检口径是**匿名内存**(`/proc/self/smaps_rollup` 的 `Anonymous:` 行;
+  任何读取/解析失败 → stderr 告警一次并回退 `ru_maxrss` 总量,红线变松
+  不消失)。run #1 实测 `ru_maxrss` 峰值 169MB,大头是 LMDB 走读留下的
+  可回收 mmap 文件页(内核在 cgroup 顶下回收),不构成真实分配压力 ——
+  拿它做红线会在服务器 150m cgroup 下误杀;匿名值才反映真分配。匿名值是
+  逐块**当前采样**而非内核峰值,采样间隔间的尖峰由 cgroup 硬顶兜底
+  (服务器 `mem_limit: 150m`,本地可 `systemd-run -p MemoryMax=1G`)。
 - 中间态唯一落点 `out_dir/.staging/work.db`(gitignored);轮次开始先删
   陈旧 work.db,成功后清空 `.staging`。
 - 任何阶段异常(含 RSS 超限、API 重试耗尽、分片校验不符)→ 只覆写
@@ -116,9 +123,10 @@ timer 每日触发 `docker compose run --rm blocklist-exporter`,产物落仓目�
 | `cidr_units` / `units_v6` | 池内 CIDR / v6 单元数 |
 | `first_seen_coverage` | 恶意池内 `first_seen` 非空占比 |
 | `walk_stats` | T1 统计(units_total/units_v4/units_v6/cidr_units/per_source/first_seen_coverage/skipped_anomalies) |
-| `enrich_stats` | T2 统计(queried/malicious/requests/retries/rate_limited/elapsed_s) |
+| `enrich_stats` | T2 统计(queried/malicious/requests/retries/rate_limited/peak_rss_anon_mb/elapsed_s) |
 | `elapsed_s` | 全管线耗时(秒) |
-| `peak_rss_mb` | 进程峰值 RSS(ru_maxrss) |
+| `peak_rss_mb` | 进程峰值 RSS 总量(ru_maxrss;含可回收 mmap 文件页,仅观测,非红线) |
+| `peak_rss_anon_mb` | 匿名内存峰值(enrich 逐块采样取 max;`--max-rss-mb` 红线口径。当前采样非内核峰值,采样间隔的尖峰由 cgroup 硬顶兜底) |
 | `api_base` | 本轮采样的引擎 API 基址 |
 | `error` | 仅失败轮出现:失败描述(带 `[阶段]` 前缀) |
 
