@@ -1,0 +1,89 @@
+# ip-radar 黑名单每日导出器(oneshot sidecar)——部署资产 Task 5。
+#
+# 不守护:绝不 `docker compose up`(profiles=export 已隔离);由
+# systemd timer(deploy/ipradar-blocklist.timer)或手工触发:
+#   docker compose -f deploy/docker-compose.exporter.yml --profile export run --rm blocklist-exporter
+#
+# 职责切分(定案):容器只**生成**产物进 /repo;PAT 推送在**宿主机**
+# push.sh 执行 —— token 永不进容器环境,故本文件无任何 secret。唯一的
+# 容器内凭据是引擎查询 key(IPRADAR_API_KEY,见下 environment 注释)。
+# 2026-10-03 final-review 裁定:引擎查询端点强制 Bearer 鉴权,导出器必须
+# 携 key 调用;该 key 与 PAT 分开置备(后者 0600 宿主文件、永不进容器)。
+#
+# 镜像复用引擎 ipradar:latest(服务器已本地构建,零新构建;自带
+# python3.12 + lmdb 依赖)。注意:镜像 ENTRYPOINT(/entrypoint.sh)
+# 无条件 exec uvicorn 且无视 CMD,导出器必须覆写 entrypoint,否则
+# 容器会启动 API 服务而非导出。
+#
+# 内存:服务器共 964Mi(常驻仅 ~124Mi 可用)。150m 是 cgroup 硬顶,
+# 兜在 CLI 自身 --max-rss-mb 140(匿名 RSS 自检,见仓 README 内存红线)
+# 之外作机器保险;fail-small 原则:爆顶只死导出器,绝不拖垮引擎。restart: "no"——
+# 一次性日任务,卡死的导出器绝不能自旋,等下一轮 timer 即可。
+
+name: ipradar-blocklist
+
+services:
+  blocklist-exporter:
+    image: ipradar:latest
+    profiles: ["export"]        # 普通 `docker compose up` 永不启动它
+    mem_limit: 150m             # 964Mi 服务器:上限宁小勿大,爆顶死任务不死引擎
+    restart: "no"               # oneshot:卡死不循环(restart=any 都会自旋)
+    init: true                  # 收割子进程、正确转发 SIGTERM
+    entrypoint: ["python"]      # 覆写镜像 entrypoint(其硬编码 exec uvicorn)
+    working_dir: /repo
+    command:
+      - /repo/scripts/generate_blocklist.py
+      - --engine-path
+      - /app/backend
+      - --data-dir
+      - /app/data               # 与引擎容器完全相同的容器内路径(同一命名卷)
+      - --api-base
+      - http://ipradar:8000     # 引擎 compose 服务名即 `ipradar`(已核对引擎仓)
+      - --out-dir
+      - /repo
+      - --max-rss-mb
+      - "140"                   # 进程自检红线,略低于 150m cgroup 顶
+    environment:
+      # 引擎 registry 在 import 期消费 IP_RADAR_DATA_DIR;与 --data-dir 一致
+      # 且与引擎容器内路径相同,防影子路径读错数据。
+      IP_RADAR_DATA_DIR: /app/data
+      # 引擎查询端点的 Bearer 凭据(api_key_dep:非同源程序化请求无 key 即
+      # 401)。由宿主 env 经 compose 插值透传 —— 注意与 push PAT 的边界
+      # 差异:这枚 key 必须进容器(它是容器内 API 客户端的凭据),故 root
+      # 可经 docker inspect 读到容器 env(final-review 裁定:已接受边界;
+      # PAT 则永不进容器)。置备步骤见 deploy/README。
+      IPRADAR_API_KEY: ${IPRADAR_API_KEY:-}
+    volumes:
+      # 仓根 rw:产物落这里;推送由宿主机 push.sh 之后执行(不在容器内)
+      - ..:/repo
+      # 引擎 LMDB 数据:直接挂引擎栈的**命名卷**(external,声明见顶层
+      # volumes),挂载点取引擎自身的 /app/data —— 不猜宿主 bind 路径,
+      # 不存在「猜错路径挂到自动建的空目录 → 空 blocklist」这一类风险;
+      # 且 --data-dir / IP_RADAR_DATA_DIR 与引擎容器内同路径,引擎代码里的
+      # 相对 ptr/sidecar 解析按构造一致。
+      - blocklist-engine-data:/app/data:ro
+      # 刻意**不**挂 IPRADAR_BACKEND_DIR:/app/backend:ro —— 镜像已烤入
+      # /app/backend(引擎 compose 从仓根 context 构建,baked 内容即权威
+      # 版本,且已实机验证引擎 import 走通);不猜宿主 backend 路径,
+      # 与数据卷同理消除路径猜测失败面。
+    networks:
+      - ipradar
+
+networks:
+  ipradar:
+    # 引擎栈(ip-lookup-tool compose 项目)的 docker 网络;项目改名时用
+    # 环境变量 IPRADAR_NETWORK 覆盖。
+    name: ${IPRADAR_NETWORK:-ip-lookup-tool_default}
+    external: true
+    # 无需 extra_hosts:引擎容器以 compose 服务别名 `ipradar` 附着在本网络
+    # (已核对引擎仓 docker-compose.yml 服务键),Docker 内置 DNS 直接解析
+    # http://ipradar:8000 —— 写死 IP 反而脆弱。
+
+volumes:
+  blocklist-engine-data:
+    # 引擎栈(ip-lookup-tool compose 项目)的 LMDB 数据命名卷;引擎项目名
+    # 不同时用环境变量 IPRADAR_DATA_VOLUME 覆盖(卷全名 = <项目>_ipradar-data)。
+    # external=true:本栈绝不创建/删除它,只读消费;不存在时 compose up
+    # 直接报错(而非静默建空卷),空数据风险在部署自检阶段即暴露。
+    name: ${IPRADAR_DATA_VOLUME:-ip-lookup-tool_ipradar-data}
+    external: true

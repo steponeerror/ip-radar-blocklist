@@ -1,0 +1,15 @@
+# 每日 04:30 触发 ipradar-blocklist.service(oneshot 导出 + 推送)。
+# 安装与启用见 deploy/ipradar-blocklist.service 头注。
+
+[Unit]
+Description=Nightly trigger for ipradar-blocklist export
+
+[Timer]
+# 对齐摄取完成时间再调
+OnCalendar=*-*-* 04:30:00
+# 停机跨过触发点 → 开机补跑一轮,不空窗
+Persistent=true
+Unit=ipradar-blocklist.service
+
+[Install]
+WantedBy=timers.target
