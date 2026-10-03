@@ -6,6 +6,18 @@ Daily tiered IP blocklist generated from the
 
 > ip-radar 威胁情报引擎的每日阶梯黑名单导出：44 源聚合、全源共识判定，供防火墙 / fail2ban / 研究直接取用。
 
+## Download
+
+Each day's export is published as a [GitHub Release](releases) with all tiers attached as assets.
+
+**Always-latest URL** (CDN-backed, stable):
+
+```
+https://github.com/steponeerror/ip-radar-blocklist/releases/latest/download/top_100.txt
+```
+
+Swap `top_100` for `top_500` / `top_1000` / `top_5000` / `top_10000`, or `.csv` for the enriched format.
+
 ## Files
 
 | File | Content |
@@ -42,18 +54,17 @@ expansion — units are exported at the granularity the sources recorded them.
 ## Usage
 
 ```bash
-# fetch
-curl -fsSL https://raw.githubusercontent.com/steponeerror/ip-radar-blocklist/main/top_1000.txt
+# fetch latest
+curl -fsSL -o blocklist.txt \
+  https://github.com/steponeerror/ip-radar-blocklist/releases/latest/download/top_1000.txt
 
 # ipset (iptables)
 ipset create ipradar hash:net
-curl -fsSL https://raw.githubusercontent.com/steponeerror/ip-radar-blocklist/main/top_1000.txt | ipset restore
+ipset restore < blocklist.txt
 iptables -I INPUT -m set --match-set ipradar src -j DROP
 ```
 
-For fail2ban, point an `ipset`-backed action at the same URL. Consumers wanting
-raw URLs with stable paths: files are committed to `main` daily and overwritten
-in place — fetch by raw URL, or clone with `--depth 1`.
+For fail2ban, point an `ipset`-backed action at the same URL.
 
 ## License
 

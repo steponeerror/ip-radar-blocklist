@@ -9,3 +9,7 @@ docs/superpowers/
 .superpowers/
 .playwright-mcp/
 .staging/
+# 每日产物走 Release,不进 git(本地试跑输出)
+top_*.txt
+top_*.csv
+manifest.json
