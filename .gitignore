@@ -3,3 +3,9 @@ __pycache__/
 .venv/
 # 每日产物由 CI 生成提交,本地试跑输出不入库
 /dist/
+
+# SDD/计划工作区与杂项
+docs/superpowers/
+.superpowers/
+.playwright-mcp/
+.staging/

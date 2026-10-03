@@ -28,9 +28,7 @@ CSV,公开于 GitHub,供防火墙 / fail2ban / 研究直接取用。
    Actions 拉不到库)vs GitHub Actions 经公开 API 拉
 2. **选数细则**:排序键(置信度?源数?最近活跃?)、IPv4/IPv6 拆分、单 IP
    vs 网段、截断边界
-3. **许可口径**:聚合再分发 = 再分发源数据。AbuseIPDB(API 数据)、Spamhaus
-   等 ToS 禁止再分发;需决定「仅允许再分发的源子集」还是「衍生聚合品」口径。
-   源模块清单:server 仓 `backend/ipdb/_sources/`(47 文件)
+3. ✅ **许可口径(2026-09-29 拍板,2026-10-03 推翻重定)**:全源重算 —— 导出物是对全部源证据重算出的共识衍生数据,视为新数据,**不设再分发限制、不做净源 allowlist**;不做逐源许可审计,不做 firehol/ipsum 聚合器剔除。
 4. **发布形态**:产物 commit 到 main / 每日 GitHub Release / gh-pages
 5. **凭据**:服务器 push 用的 fine-grained PAT(只写本仓)
 
