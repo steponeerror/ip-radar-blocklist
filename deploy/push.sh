@@ -47,7 +47,7 @@ RELEASE_ID=$(echo "$RELEASE_RESP" | python3 -c "import json,sys; print(json.load
 echo "[push.sh] Release $TAG created (id=$RELEASE_ID)"
 
 # 上传 assets
-UPLOAD_URL="$REPO_API/releases/$RELEASE_ID/assets"
+UPLOAD_URL="https://uploads.github.com/repos/steponeerror/ip-radar-blocklist/releases/$RELEASE_ID/assets"
 for f in "${FILES[@]}"; do
     if [[ ! -f "$f" ]]; then
         echo "[push.sh] WARNING: $f 不存在,跳过" >&2
