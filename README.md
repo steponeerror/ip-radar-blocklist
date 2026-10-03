@@ -33,13 +33,13 @@ honest signal). Updated daily.
 ## CSV columns
 
 ```
-ip,asn,country,classes,confidence,source_count,sources,first_seen,last_seen
+ip,asn,country,classes,confidence,source_count,first_seen,last_seen
 ```
 
 - `ip` — single IP or CIDR, exactly as recorded by the engine
 - `classes` — threat categories (`;`-joined, e.g. `brute-force;scanner`)
 - `confidence` — engine consensus confidence, 0–100
-- `source_count` / `sources` — how many independent sources flagged it, and which
+- `source_count` — how many independent sources flagged it
 - `first_seen` / `last_seen` — earliest / latest observation across sources (may be empty)
 
 Entries are ranked by **source_count ↓, confidence ↓, recency ↓** — the top of
