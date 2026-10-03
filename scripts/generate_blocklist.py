@@ -6,7 +6,7 @@ wires the three stage modules together as one command:
 
     python scripts/generate_blocklist.py \
         --engine-path <backend> --data-dir <LMDB data> --api-base <engine URL> \
-        [--out-dir .] [--max-rss-mb 140]
+        [--out-dir .] [--max-rss-mb 140] [--api-key <engine API key>]
 
 Orchestration: work db lives at ``<out_dir>/.staging/work.db`` (a real file,
 not ``:memory:`` — it is the pipeline's only intermediate state and must
@@ -75,6 +75,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--max-rss-mb", type=int, default=140,
                    help="ru_maxrss budget in MB; exceeding aborts the run "
                         "(default: 140)")
+    p.add_argument("--api-key", default=os.environ.get("IPRADAR_API_KEY"),
+                   help="engine API key, sent as 'Authorization: Bearer' on "
+                        "every /api/query/stream request (the engine enforces "
+                        "key auth on programmatic requests; without one the "
+                        "run aborts on the first 401). Default: env "
+                        "IPRADAR_API_KEY if set, else none")
     return p.parse_args(argv)
 
 
@@ -148,11 +154,13 @@ def main(argv: list[str] | None = None) -> int:
 
         stage = "enrich"
         enrich_stats = consensus_client.enrich_with_consensus(
-            db, args.api_base, max_rss_mb=args.max_rss_mb)
+            db, args.api_base, max_rss_mb=args.max_rss_mb,
+            api_key=args.api_key)
         _log(f"[enrich] queried={enrich_stats['queried']}"
              f" malicious={enrich_stats['malicious']}"
              f" requests={enrich_stats['requests']}"
              f" retries={enrich_stats['retries']}"
+             f" rate_limited={enrich_stats['rate_limited']}"
              f" elapsed_s={enrich_stats['elapsed_s']:.1f}")
 
         stage = "emit"

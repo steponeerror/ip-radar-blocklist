@@ -9,6 +9,12 @@ carries error+code. Pure-stdlib module under test: no engine import here.
 Retry semantics (supervisor ruling on plan text 「3 次指数退避重试」):
 initial attempt + 3 retries = 4 attempts total, backoffs 2/4/8s; requests
 stat counts ALL HTTP attempts, retries counts attempts beyond the first.
+
+Auth/pacing/429 tolerance (final-review P1 fix): api_key → every request
+(retries included) carries `Authorization: Bearer <key>` (engine api_key_dep
+else 401); request starts are paced ≥ MIN_REQUEST_INTERVAL_S; HTTP 429 is
+transient — sleep the envelope's retry_after, retry the same chunk without
+consuming the attempt budget, abort loudly past 10 rate-limit events per run.
 """
 import json
 import sqlite3
@@ -38,6 +44,13 @@ CREATE TABLE units(
 """
 
 NO_BACKOFF = (0.0, 0.0, 0.0)   # test injection: real 2/4/8s is nightly-grade
+
+
+@pytest.fixture(autouse=True)
+def _no_pacing(monkeypatch):
+    """配速常量归零保套件快(引擎 1.1s 真实配速是夜间轮量级);
+    专测配速的用例在测试体内自行覆写回正值。"""
+    monkeypatch.setattr(cc, "MIN_REQUEST_INTERVAL_S", 0.0)
 
 
 @pytest.fixture
@@ -102,6 +115,22 @@ def _done_ok() -> dict:
 
 def _envelope(code, message) -> bytes:
     return json.dumps({"error": {"code": code, "message": message}}).encode("utf-8")
+
+
+def _rl_envelope(retry_after) -> bytes:
+    """引擎 429 信封(main.py _rate_limit_handler 钉死形态):
+    {"error": {code, message, retry_after}}。"""
+    return json.dumps({"error": {"code": "rate_limited",
+                                 "message": "rate limit exceeded",
+                                 "retry_after": retry_after}}).encode("utf-8")
+
+
+def _benign_responder(attempt_no, ips, headers):
+    """通用全 benign 回放:每输入恰一行,顺序直出。"""
+    events = [_start(ips)]
+    events += [_row_evt(i, _row(ip, "benign", 0)) for i, ip in enumerate(ips)]
+    events.append(_done_ok())
+    return 200, "application/x-ndjson", _ndjson(*events)
 
 
 # ── stub server: records every request, replays canned protocol ──
@@ -223,11 +252,12 @@ def test_enrich_fields_headers_anchors_and_stats(db, stub):
 
     stats = cc.enrich_with_consensus(db, s.base)
 
-    # demo-mode 守卫头 + UA 逐请求都在
+    # demo-mode 守卫头 + UA 逐请求都在;无 key 时绝不带 Authorization
     for h in s.log_headers:
         assert h.get("x-ipradar-client") == "web"
         assert h.get("user-agent") == "ipradar-blocklist-exporter/1.0"
         assert h.get("content-type") == "application/json"
+        assert "authorization" not in h
     # body ips 是锚点形态(CIDR 剥前缀),顺序 = rowid 序
     assert s.log_bodies == [["203.0.113.7", "203.0.113.0",
                              "198.51.100.5", "192.0.2.1"]]
@@ -248,11 +278,12 @@ def test_enrich_fields_headers_anchors_and_stats(db, stub):
                                  None, None, None)
 
     assert set(stats) == {"queried", "malicious", "requests", "retries",
-                          "elapsed_s"}
+                          "rate_limited", "elapsed_s"}
     assert stats["queried"] == 4
     assert stats["malicious"] == 2
     assert stats["requests"] == 1
     assert stats["retries"] == 0
+    assert stats["rate_limited"] == 0
     assert stats["elapsed_s"] >= 0
 
 
@@ -443,5 +474,88 @@ def test_empty_universe_makes_no_requests(db, stub):
     s = stub(_main_responder)
     stats = cc.enrich_with_consensus(db, s.base)
     assert stats == {"queried": 0, "malicious": 0, "requests": 0,
-                     "retries": 0, "elapsed_s": stats["elapsed_s"]}
+                     "retries": 0, "rate_limited": 0,
+                     "elapsed_s": stats["elapsed_s"]}
     assert s.log_bodies == []
+
+
+# ── final-review P1:Bearer 鉴权 / 配速 / 429 容忍 ──
+
+def test_api_key_bearer_header_on_every_request_including_retries(
+        db, stub, monkeypatch):
+    """api_key 传入 → 每次请求(含重试)都带 Authorization: Bearer <key>。
+    引擎 api_key_dep 对非同源程序化请求无 key 即 401,头必须在重试路径
+    也存在(重试用同一 _stream_once 入口,非绕行)。"""
+    monkeypatch.setattr(cc, "_BACKOFF_SECONDS", NO_BACKOFF)
+    _add_units(db, "203.0.113.7")
+
+    def responder(attempt_no, ips, headers):
+        if attempt_no == 1:                     # 逼出一次重试
+            return 503, "application/json", _envelope("unavailable", "blip")
+        return 200, "application/x-ndjson", _ndjson(
+            _start(ips), _row_evt(0, _row("203.0.113.7", "benign", 0)),
+            _done_ok())
+
+    s = stub(responder)
+    cc.enrich_with_consensus(db, s.base, api_key="test-engine-key-1")
+    assert len(s.log_headers) == 2              # 首次 + 重试都带 key
+    for h in s.log_headers:
+        assert h.get("authorization") == "Bearer test-engine-key-1"
+
+
+def test_http_429_waits_retry_after_then_retries_same_chunk(
+        db, stub, monkeypatch):
+    """429 是瞬态非永久:按信封 retry_after 等待后重试同块,不耗 3 次
+    预算,统计进 rate_limited —— 不同于其它 4xx 的立即中止。"""
+    sleeps: list[float] = []
+    monkeypatch.setattr(cc.time, "sleep", sleeps.append)
+    _add_units(db, "203.0.113.7")
+
+    def responder(attempt_no, ips, headers):
+        if attempt_no == 1:
+            return 429, "application/json", _rl_envelope(7)
+        return 200, "application/x-ndjson", _ndjson(
+            _start(ips), _row_evt(0, _row("203.0.113.7", "malicious", 87,
+                                         classifications={"scanner": _cls(
+                                             "scanner", "malicious", True,
+                                             ["dataplane"])})),
+            _done_ok())
+
+    s = stub(responder)
+    stats = cc.enrich_with_consensus(db, s.base)
+    assert sleeps == [7.0]                      # retry_after 被尊重
+    assert stats["rate_limited"] == 1
+    assert stats["requests"] == 2               # 同块重试
+    assert stats["retries"] == 1                # 首次之后的尝试
+    assert stats["queried"] == 1                # 未计永久失败
+    assert _units_by_ip(db)["203.0.113.7"][0] == "malicious"
+
+
+def test_pacing_sleeps_remainder_between_request_starts(db, stub, monkeypatch):
+    """请求起点配速(非完成时刻):MIN_REQUEST_INTERVAL_S > 0 时,第二个
+    块的首请求前补足与上一请求起点的间隔余量;首请求无前驱不睡。"""
+    monkeypatch.setattr(cc, "MIN_REQUEST_INTERVAL_S", 0.5)
+    sleeps: list[float] = []
+    monkeypatch.setattr(cc.time, "sleep", sleeps.append)
+    _add_units(db, "203.0.113.7", "198.51.100.5")
+
+    s = stub(_benign_responder)
+    cc.enrich_with_consensus(db, s.base, chunk=1)
+
+    assert [len(b) for b in s.log_bodies] == [1, 1]   # 两块,各一请求
+    # 全部 200 无重试 → 唯一的 sleep 就是第二块前的配速余量;
+    # sleep 被替换不耗时,余量 = 间隔 - 两次起点间真实耗时(本地环回
+    # ≈ 毫秒级,断言窗口留足裕量)
+    assert len(sleeps) == 1
+    assert 0.3 <= sleeps[0] <= 0.5
+
+
+def test_rate_limit_events_over_cap_abort_loudly(db, stub, monkeypatch):
+    """楔死的限流器:单轮容忍 10 次 429,第 11 次响亮终止(而非无限等)。"""
+    monkeypatch.setattr(cc.time, "sleep", lambda sec: None)
+    _add_units(db, "203.0.113.7")
+    s = stub(lambda n, ips, h: (429, "application/json", _rl_envelope(1)))
+
+    with pytest.raises(cc.ConsensusStreamError, match="rate-limited"):
+        cc.enrich_with_consensus(db, s.base)
+    assert len(s.log_bodies) == 11              # 10 次容忍 + 1 次触发中止

@@ -17,6 +17,11 @@ Universe (7 units, shaped): 4 v4 /32 + 1 v6 /128 (dataplane raw) + 1 v4 CIDR
 + 1 v6 CIDR (turris csv) → stub verdicts: 4 malicious (including the v6 line
 and the v4-CIDR line that must surface in every tier), 1 suspicious, 2
 benign — none of the latter may appear in any artifact.
+
+Auth (final-review P1): the stub optionally enforces the engine's key gate
+(`required_key=`) — happy path runs the CLI WITH --api-key against a
+key-requiring stub; a dedicated keyless run pins the 401 permanent-abort
+failure mode (error manifest, nothing published) forever.
 """
 import json
 import os
@@ -125,10 +130,14 @@ def _ok_responder(attempt_no, ips, headers):
 
 
 class _Stub:
-    """responder(attempt_no, ips, headers) -> (status, ctype, payload)."""
+    """responder(attempt_no, ips, headers) -> (status, ctype, payload);
+    required_key set → non-Bearer requests get the engine's 401 envelope
+    (mirrors api_key_dep: programmatic requests without a key fail)."""
 
-    def __init__(self, responder):
+    def __init__(self, responder, required_key=None):
+        self.required_key = required_key
         self.requests: list[list[str]] = []
+        self.auth_headers: list[str | None] = []
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -137,6 +146,21 @@ class _Stub:
                     int(self.headers.get("Content-Length", 0)))
                 ips = json.loads(body).get("ips", [])
                 outer.requests.append(ips)
+                outer.auth_headers.append(self.headers.get("Authorization"))
+                if (outer.required_key is not None
+                        and self.headers.get("Authorization")
+                        != f"Bearer {outer.required_key}"):
+                    payload = json.dumps(
+                        {"error": {"code": "unauthorized",
+                                   "message": "API key required for"
+                                              " programmatic access"}}
+                    ).encode("utf-8")
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 status, ctype, payload = responder(
                     len(outer.requests), ips, self.headers)
                 self.send_response(status)
@@ -168,9 +192,9 @@ class _Stub:
 def stub():
     s = None
 
-    def factory(responder):
+    def factory(responder, required_key=None):
         nonlocal s
-        s = _Stub(responder)
+        s = _Stub(responder, required_key=required_key)
         return s
 
     yield factory
@@ -178,10 +202,12 @@ def stub():
         s.stop()
 
 
-# ── CLI 子进程(真实 sys.executable,环境不泄漏 IP_RADAR_DATA_DIR)──
+# ── CLI 子进程(真实 sys.executable,环境不泄漏 IP_RADAR_DATA_DIR
+# 与 IPRADAR_API_KEY —— key 只允许经 --api-key 旗标进入被测进程)──
 
 def _run_cli(*flags: str, timeout: int = 120) -> subprocess.CompletedProcess:
-    env = {k: v for k, v in os.environ.items() if k != "IP_RADAR_DATA_DIR"}
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("IP_RADAR_DATA_DIR", "IPRADAR_API_KEY")}
     return subprocess.run(
         [sys.executable, str(CLI), *map(str, flags)],
         capture_output=True, text=True, cwd=REPO_ROOT, env=env,
@@ -193,10 +219,11 @@ def _run_cli(*flags: str, timeout: int = 120) -> subprocess.CompletedProcess:
 def test_cli_end_to_end_publishes_tiers_and_merged_manifest(
         data_dir, stub, tmp_path):
     out_dir = tmp_path / "out"
-    s = stub(_ok_responder)
+    s = stub(_ok_responder, required_key="it-engine-key-1")
 
     proc = _run_cli("--engine-path", ENGINE_BACKEND, "--data-dir", data_dir,
-                    "--api-base", s.base, "--out-dir", out_dir)
+                    "--api-base", s.base, "--out-dir", out_dir,
+                    "--api-key", "it-engine-key-1")
 
     assert proc.returncode == 0, f"stderr:\n{proc.stderr}"
     # 每阶段恰好一行带计数的进度(stderr;stdout 只允许 manifest JSON)
@@ -234,13 +261,16 @@ def test_cli_end_to_end_publishes_tiers_and_merged_manifest(
     assert manifest["enrich_stats"]["queried"] == 7
     assert manifest["enrich_stats"]["malicious"] == 4
     assert manifest["enrich_stats"]["requests"] == 1
+    assert manifest["enrich_stats"]["rate_limited"] == 0
     assert manifest["api_base"] == s.base
     assert manifest["elapsed_s"] > 0
     assert manifest["peak_rss_mb"] > 0
 
-    # 单次整批请求(7 单位 < chunk 500),锚点形态(CIDR 剥前缀、v6 原样);
+    # 单次整批请求(7 单位 < chunk 2500),锚点形态(CIDR 剥前缀、v6 原样);
     # 批内顺序是 LMDB 键序(游标枚举),契约只钉集合不钉顺序
     assert len(s.requests) == 1
+    # Bearer 头全程携带(stub 的 required_key 门即反证)
+    assert s.auth_headers == ["Bearer it-engine-key-1"]
     assert sorted(s.requests[0]) == sorted([
         "203.0.113.7", "203.0.113.5", "198.51.100.5", "192.0.2.1",
         "2001:db8::1", "198.51.100.0", "2001:db8:aaaa::"])
@@ -271,7 +301,9 @@ def test_cli_local_anchor_data_dir_flag_drives_registry(data_dir, stub,
     别的 IP_RADAR_DATA_DIR,子进程也按旗标走(7 单位宇宙,而非别的)。"""
     out_dir = tmp_path / "out2"
     s = stub(_ok_responder)
-    env = {**os.environ, "IP_RADAR_DATA_DIR": "/nonexistent-data-dir"}
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("IP_RADAR_DATA_DIR", "IPRADAR_API_KEY")}
+    env["IP_RADAR_DATA_DIR"] = "/nonexistent-data-dir"
     proc = subprocess.run(
         [sys.executable, str(CLI), "--engine-path", str(ENGINE_BACKEND),
          "--data-dir", str(data_dir), "--api-base", s.base,
@@ -309,4 +341,30 @@ def test_cli_engine_always_500_writes_error_manifest_nothing_published(
     assert "enrich" in payload["error"]              # 失败阶段可辨认
     assert payload["walk_stats"]["units_total"] == 7  # 部分统计透传
     assert "error" in proc.stderr                     # error manifest → stderr
+    assert proc.stdout == ""
+
+
+# ── 失败路径(final-review P1 钉死):无 key 调鉴权引擎 → 401 永久中止 ──
+
+def test_cli_missing_api_key_401_permanent_abort_error_manifest(
+        data_dir, stub, tmp_path):
+    """keyless 运行撞引擎 api_key_dep:401 信封不重试、不进
+    429 容忍路径,直接永久失败 → error manifest、无半成品、
+    退出码 1。把 P1 的失败形态永久钉死在套件里。"""
+    out_dir = tmp_path / "out"
+    s = stub(_ok_responder, required_key="it-engine-key-1")
+
+    proc = _run_cli("--engine-path", ENGINE_BACKEND, "--data-dir", data_dir,
+                    "--api-base", s.base, "--out-dir", out_dir)
+
+    assert proc.returncode == 1
+    assert len(s.requests) == 1          # 401 是永久错:不重试
+    assert s.auth_headers == [None]      # 真的没带 key
+    assert [p_.name for p_ in out_dir.iterdir()] == ["manifest.json"]
+    payload = json.loads(
+        (out_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert "401" in payload["error"]
+    assert "enrich" in payload["error"]              # 失败阶段可辨认
+    assert payload["walk_stats"]["units_total"] == 7  # 部分统计透传
+    assert "error" in proc.stderr
     assert proc.stdout == ""

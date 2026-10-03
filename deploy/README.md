@@ -20,6 +20,14 @@ systemd timer (每日 04:30, Persistent=true)
 rw 仓目录,**token 永不进容器环境/compose 文件/镜像** —— 即便容器被攻破也
 推不动仓库。compose 文件里因此没有任何 secret。
 
+**引擎查询 key 是另一枚凭据,边界不同**(2026-10-03 final-review 裁定):引擎
+查询端点(含 `POST /api/query/stream`)强制 Bearer key 鉴权,非同源程序化请求
+无 key 即 401,故导出器必须带 key 调用 —— key 只能经 compose
+`environment: IPRADAR_API_KEY: ${IPRADAR_API_KEY:-}` 透传**进容器**,即对
+root 可见(`docker inspect` 能读容器 env)。这是已接受的边界:容器被攻破也
+只多得一枚**可吊销的查询 key**(引擎 Admin UI 随时可删),推不动仓库;与
+push PAT(永不进容器)形成对照。置备步骤见下第 5 步。
+
 ## 安装步骤(root)
 
 ```bash
@@ -40,16 +48,32 @@ docker volume inspect ip-lookup-tool_ipradar-data --format '{{.Mountpoint}}'
 #   若引擎 compose 项目名不同,卷全名 = <项目名>_ipradar-data,
 #   导出 IPRADAR_DATA_VOLUME=<实际卷名>(可写进 unit 的 Environment=)
 
-# 5. 放置 PAT(0600,root;只在宿主机)
+# 5. 置备引擎查询 key(0600,root;导出器调 /api/query/stream 用)
+#    浏览器同源登录引擎 Admin UI(/admin)→ API Keys → 创建一枚给导出器用
+#    的 key,然后宿主机落盘(env 文件形式,供 compose 插值):
+umask 077 && install -d /root/.config
+cat > /root/.config/blocklist-engine.env   # 写入一行:IPRADAR_API_KEY=<粘贴的 key>,Ctrl-D
+chmod 600 /root/.config/blocklist-engine.env
+#    timer 路径:systemd drop-in 把 env 文件喂给 unit(compose 在 ExecStart
+#    进程内完成 ${IPRADAR_API_KEY:-} 插值):
+systemctl edit ipradar-blocklist.service
+#      [Service]
+#      EnvironmentFile=/root/.config/blocklist-engine.env
+#    (手工跑前则 shell 里 set -a; . /root/.config/blocklist-engine.env; set +a)
+#    边界说明:这枚 key 经容器 env 传递,root 可 docker inspect 读到 ——
+#    已接受(可吊销的查询凭据);push PAT 则永不进容器,见上文对照。
+
+# 6. 放置 PAT(0600,root;只在宿主机)
 umask 077 && install -d /root/.config
 cat > /root/.config/blocklist-push.token    # 粘贴 token,Ctrl-D
 chmod 600 /root/.config/blocklist-push.token
 
-# 6. 试跑一轮(生成 + 推送)
+# 7. 试跑一轮(生成 + 推送;先带引擎 key)
+set -a; . /root/.config/blocklist-engine.env; set +a
 docker compose -f deploy/docker-compose.exporter.yml --profile export \
   run --rm blocklist-exporter && deploy/push.sh
 
-# 7. 安装并启用 timer
+# 8. 安装并启用 timer
 cp deploy/ipradar-blocklist.service deploy/ipradar-blocklist.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now ipradar-blocklist.timer
@@ -73,6 +97,7 @@ systemctl list-timers ipradar-blocklist.timer   # 核对下次触发点
 
 | 变量 | 默认 | 用途 |
 |---|---|---|
+| `IPRADAR_API_KEY` | _(空;不带 key 引擎即 401)_ | 引擎查询端点 Bearer 凭据;由 unit 的 `EnvironmentFile`(0600 env 文件)或手工 `export` 提供,compose 插值透传进容器。root 可经 `docker inspect` 读到 —— 已接受边界(可吊销查询凭据),与 push PAT(永不进容器)对照 |
 | `IPRADAR_DATA_VOLUME` | `ip-lookup-tool_ipradar-data` | 引擎栈的 LMDB 数据**命名卷**全名(`<引擎项目名>_ipradar-data`);导出器以只读方式挂到与引擎容器相同的 `/app/data`,不猜宿主路径 |
 | `IPRADAR_NETWORK` | `ip-lookup-tool_default` | 引擎 compose 项目网络 |
 
@@ -90,8 +115,9 @@ systemctl list-timers ipradar-blocklist.timer   # 核对下次触发点
 为 failed、**未推送**;档位文件保持上一成功轮原样。处理:
 `journalctl -u ipradar-blocklist.service` 看容器 stderr 进度行定位阶段,
 修复后 `systemctl start ipradar-blocklist.service` 重跑。常见失败:
-引擎未起/网络名不对(walk 前连通失败)、RSS 超限(看 `error` 里的阶段)、
-token 失效(push 阶段,ExecStartPost)。
+引擎未起/网络名不对(walk 前连通失败)、引擎 key 缺失/失效(enrich 阶段
+401 永久中止 —— 核对 IPRADAR_API_KEY 与 Admin UI 里的 key 状态)、
+RSS 超限(看 `error` 里的阶段)、token 失效(push 阶段,ExecStartPost)。
 
 另:开机补跑(Persistent=true)可能赶上引擎容器仍在 60s healthcheck
 start_period 内 —— 首轮 walk 失败属预期,**下一轮 timer 会自愈**,勿慌张干预。
