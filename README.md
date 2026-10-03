@@ -101,7 +101,7 @@ timer 每日触发 `docker compose run --rm blocklist-exporter`,产物落仓目�
 - 三段全流式:LMDB 游标枚举(executemany ≤2500/批)、NDJSON 逐行消费、
   sqlite 游标直写档位文件;单元集合从不物化进 Python list/dict。
 - 自检口径是**匿名内存**(`/proc/self/smaps_rollup` 的 `Anonymous:` 行;
-  任何读取/解析失败 → stderr 告警一次并回退 `ru_maxrss` 总量,红线变松
+  任何读取/解析失败 → stderr 告警一次并回退 `ru_maxrss` 总量,红线变紧
   不消失)。run #1 实测 `ru_maxrss` 峰值 169MB,大头是 LMDB 走读留下的
   可回收 mmap 文件页(内核在 cgroup 顶下回收),不构成真实分配压力 ——
   拿它做红线会在服务器 150m cgroup 下误杀;匿名值才反映真分配。匿名值是
