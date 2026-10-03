@@ -120,22 +120,22 @@ def test_sort_chain_txt_purity_and_csv_verbatim(db, out_dir):
     raw_csv = (out_dir / "top_100.csv").read_bytes()
     assert raw_csv.endswith(b"\n") and b"\r" not in raw_csv
     lines = raw_csv.split(b"\n")
-    # 表头逐字 9 列(first_seen 在 sources 与 last_seen 之间)
+    # 表头逐字 8 列(first_seen 在 source_count 与 last_seen 之间)
     assert lines[0] == (b"ip,asn,country,classes,confidence,"
-                        b"source_count,sources,first_seen,last_seen")
+                        b"source_count,first_seen,last_seen")
     # QUOTE_MINIMAL:asn 含逗号必须加引号(RFC4180)
     assert lines[1] == (b'203.0.113.10,"AS64512, Example Net",US,scanner,'
-                        b'80,4,srcA;srcB;srcC;srcD,'
+                        b'80,4,'
                         b'2026-10-01T00:00:00Z,2026-10-05T00:00:00Z')
 
     with open(out_dir / "top_100.csv", newline="", encoding="utf-8") as f:
         rows = list(csv.reader(f))
     assert rows[0] == ["ip", "asn", "country", "classes", "confidence",
-                       "source_count", "sources", "first_seen", "last_seen"]
+                       "source_count", "first_seen", "last_seen"]
     assert [r[0] for r in rows[1:]] == EXPECTED_ORDER
     # NULL 字段 → 空字符串(m6 的 first_seen/last_seen/asn/country 皆 NULL)
     m6 = rows[1 + EXPECTED_ORDER.index("203.0.113.60")]
-    assert m6 == ["203.0.113.60", "", "", "", "70", "2", "", "", ""]
+    assert m6 == ["203.0.113.60", "", "", "", "70", "2", "", ""]
 
 
 def test_pool_smaller_than_tiers_up_to_n(db, out_dir):
@@ -205,7 +205,7 @@ def test_empty_pool_zero_byte_txt_and_header_only_csv(out_dir):
         assert (out_dir / f"top_{n}.txt").read_bytes() == b""
         assert (out_dir / f"top_{n}.csv").read_bytes() == (
             b"ip,asn,country,classes,confidence,"
-            b"source_count,sources,first_seen,last_seen\n")
+            b"source_count,first_seen,last_seen\n")
     assert manifest["malicious_pool"] == 0
     assert manifest["first_seen_coverage"] == 0.0   # 除零守卫
     assert manifest["universe"] == 2

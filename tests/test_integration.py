@@ -285,13 +285,13 @@ def test_cli_end_to_end_publishes_tiers_and_merged_manifest(
         assert (out_dir / f"top_{n}.txt").read_bytes() == expected_txt
     raw_csv = (out_dir / "top_100.csv").read_bytes()
     assert raw_csv.split(b"\n")[0] == (b"ip,asn,country,classes,confidence,"
-                                       b"source_count,sources,first_seen,"
+                                       b"source_count,first_seen,"
                                        b"last_seen")
     # CIDR 行写单元原文(锚点二象性),turris 无 first_seen/last_seen → 双空尾
-    assert ('198.51.100.0/24,64512,US,spam,60,1,turris_greylist,,'
+    assert ('198.51.100.0/24,64512,US,spam,80,1,,'
             in (out_dir / "top_100.csv").read_text(encoding="utf-8"))
     # dataplane 双填 first_seen = last_seen → 含 first_seen 值的行
-    assert ("2001:db8::1,64512,US,bruteforce,60,1,dataplane,"
+    assert ("2001:db8::1,64512,US,bruteforce,80,1,"
             "2026-10-03T00:00:00Z,2026-10-03T00:00:00Z"
             in (out_dir / "top_100.csv").read_text(encoding="utf-8"))
 

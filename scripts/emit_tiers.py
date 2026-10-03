@@ -27,10 +27,10 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-# CSV 9 列表头逐字(Global Constraints;first_seen 在 sources 与
+# CSV 8 列表头逐字(first_seen 在 source_count 与
 # last_seen 之间);SELECT 列序与之一一对应
 CSV_HEADER = ("ip", "asn", "country", "classes", "confidence",
-              "source_count", "sources", "first_seen", "last_seen")
+              "source_count", "first_seen", "last_seen")
 
 # 单条排序 SQL(Q2-B):source_count DESC → confidence DESC →
 # last_seen NULLS LAST(SQLite 无 NULLS LAST 关键字,`last_seen IS NULL`

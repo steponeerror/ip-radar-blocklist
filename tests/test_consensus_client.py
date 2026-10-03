@@ -95,9 +95,9 @@ def _merge(value, confidence=90):
                          "reliability": 1.0, "authoritative": True}]}
 
 
-def _cls(type_, verdict, detected, sources):
+def _cls(type_, verdict, detected, sources, cls_conf=80):
     return {"type": type_, "verdict": verdict, "detected": detected,
-            "confidence": 80, "algorithm": "logodds", "corroborated": len(sources) >= 2,
+            "confidence": cls_conf, "algorithm": "logodds", "corroborated": len(sources) >= 2,
             "reporter_total": len(sources), "verdict_conflict": False,
             "has_archive": False, "malware_names": [], "details": [],
             "sources": [{"source": s, "value": True, "reliability": 0.9,
@@ -218,7 +218,7 @@ def _main_responder(attempt_no, ips, headers):
     input order (idx 2,0,3,1) — mapping must go through idx, not position."""
     results = {
         "203.0.113.7": _row(
-            "203.0.113.7", "malicious", 87,
+            "203.0.113.7", "malicious", 80,
             classifications={
                 # 跨 classification 去重口径:两 detection 共享 dataplane
                 "scanner": _cls("scanner", "malicious", True,
@@ -233,7 +233,7 @@ def _main_responder(attempt_no, ips, headers):
         "203.0.113.0": _row(
             "203.0.113.0", "malicious", 60,
             classifications={"scanner": _cls("scanner", "malicious", True,
-                                             ["dataplane"])},
+                                             ["dataplane"], cls_conf=60)},
             asn=None, country="DE"),     # 缺失 MergedField value → ""
         "198.51.100.5": _row(
             "198.51.100.5", "suspicious", 40,
@@ -285,7 +285,7 @@ def test_enrich_fields_headers_anchors_and_stats(db, stub):
     rows = _units_by_ip(db)
     # malicious:跨 classification 去重 source_count=3,classes 并集,threat.confidence
     assert rows["203.0.113.7"] == (
-        "malicious", 87, "scanner;spam",
+        "malicious", 80, "scanner;spam",
         "blocklistde;dataplane;turris_greylist", 3, "64512", "US")
     # CIDR 行:键仍是单元原文,字段来自锚点行;缺失 asn value → ""
     assert rows["203.0.113.0/24"] == (
@@ -351,7 +351,7 @@ def test_http_500_then_200_retries_same_chunk(db, stub, monkeypatch):
         if attempt_no == 1:
             return 500, "application/json", _envelope("internal", "overloaded")
         events = [_start(ips),
-                  _row_evt(0, _row("203.0.113.7", "malicious", 87,
+                  _row_evt(0, _row("203.0.113.7", "malicious", 80,
                                    classifications={
                                        "scanner": _cls("scanner", "malicious",
                                                        True, ["dataplane"])})),
@@ -364,7 +364,7 @@ def test_http_500_then_200_retries_same_chunk(db, stub, monkeypatch):
     assert stats["retries"] == 1       # attempts beyond the first
     assert stats["queried"] == 1       # unit counted once despite retry
     assert _units_by_ip(db)["203.0.113.7"] == (
-        "malicious", 87, "scanner", "dataplane", 1, "64512", "US")
+        "malicious", 80, "scanner", "dataplane", 1, "64512", "US")
 
 
 def test_mid_stream_chunked_tear_retries_then_succeeds(db, monkeypatch):
@@ -395,7 +395,7 @@ def test_mid_stream_chunked_tear_retries_then_succeeds(db, monkeypatch):
                 return
             payload = _ndjson(
                 _start(["203.0.113.7"]),
-                _row_evt(0, _row("203.0.113.7", "malicious", 87,
+                _row_evt(0, _row("203.0.113.7", "malicious", 80,
                                  classifications={"scanner": _cls(
                                      "scanner", "malicious", True,
                                      ["dataplane"])})),
@@ -420,7 +420,7 @@ def test_mid_stream_chunked_tear_retries_then_succeeds(db, monkeypatch):
     assert stats["requests"] == 2
     assert stats["retries"] == 1
     assert _units_by_ip(db)["203.0.113.7"] == (
-        "malicious", 87, "scanner", "dataplane", 1, "64512", "US")
+        "malicious", 80, "scanner", "dataplane", 1, "64512", "US")
 
 
 def test_retry_exhausted_after_4_attempts_raises(db, stub, monkeypatch):
@@ -618,7 +618,7 @@ def test_http_429_waits_retry_after_then_retries_same_chunk(
         if attempt_no == 1:
             return 429, "application/json", _rl_envelope(7)
         return 200, "application/x-ndjson", _ndjson(
-            _start(ips), _row_evt(0, _row("203.0.113.7", "malicious", 87,
+            _start(ips), _row_evt(0, _row("203.0.113.7", "malicious", 80,
                                          classifications={"scanner": _cls(
                                              "scanner", "malicious", True,
                                              ["dataplane"])})),
@@ -680,7 +680,7 @@ def test_http_503_warming_waits_60s_retries_same_chunk(db, stub, monkeypatch):
             return 503, "application/json", _envelope(
                 "warming", "database is warming up")
         return 200, "application/x-ndjson", _ndjson(
-            _start(ips), _row_evt(0, _row("203.0.113.7", "malicious", 87,
+            _start(ips), _row_evt(0, _row("203.0.113.7", "malicious", 80,
                                          classifications={"scanner": _cls(
                                              "scanner", "malicious", True,
                                              ["dataplane"])})),

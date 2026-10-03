@@ -175,7 +175,7 @@ def _extract_fields(row: dict) -> tuple:
     - verdict = threat.verdict(全行存储,含 suspicious/benign/reserved);
     - 仅 malicious 行计数值字段:source_count/classes/sources 取「全部
       detected ∧ verdict=="malicious" 的 classification」里 distinct 源名
-      与 type 并集;confidence = threat.confidence;
+      与 type 并集;confidence = max malicious classification confidence;
     - 非 malicious 行数值/列表字段 NULL(suspicious 不入选,仅留 verdict)。
     """
     threat = row.get("threat") or {}
@@ -196,7 +196,14 @@ def _extract_fields(row: dict) -> tuple:
             src_names.update(
                 s.get("source") for s in (cls.get("sources") or [])
                 if s.get("source"))
-    return (verdict, threat.get("confidence"),
+    # confidence: 所有恶意分类中的最大值(与平台 UI 一致;threat.confidence
+    # 在多分类同 verdict 时按字典序碰运气,非确定性——不用)
+    max_conf = max(
+        (cls.get("confidence") for cls in (row.get("classifications") or {}).values()
+         if cls.get("detected") and cls.get("verdict") == "malicious"
+         and isinstance(cls.get("confidence"), (int, float))),
+        default=None)
+    return (verdict, max_conf,
             ";".join(sorted(classes)), ";".join(sorted(src_names)),
             len(src_names), _merged_str(row, "asn"), _merged_str(row, "country"))
 
