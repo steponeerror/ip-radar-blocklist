@@ -119,7 +119,7 @@ systemctl list-timers ipradar-blocklist.timer   # 核对下次触发点
 修复后 `systemctl start ipradar-blocklist.service` 重跑。常见失败:
 引擎未起/网络名不对(walk 前连通失败)、引擎 key 缺失/失效(enrich 阶段
 401 永久中止 —— 核对 IPRADAR_API_KEY 与 Admin UI 里的 key 状态)、
-RSS 超限(看 `error` 里的阶段)、token 失效(push 阶段,ExecStartPost)。
+RSS 超限(看 `error` 里的阶段)、token 失效(push 阶段,ExecStartPost)、引擎 503 warming(2 核机过载预热:客户端等 60s 重试同块,单轮至多 5 次才失败;配速已经 env `IPRADAR_REQUEST_INTERVAL_S=2.2` 放缓预防)。
 
 另:开机补跑(Persistent=true)可能赶上引擎容器仍在 60s healthcheck
 start_period 内 —— 首轮 walk 失败属预期,**下一轮 timer 会自愈**,勿慌张干预。

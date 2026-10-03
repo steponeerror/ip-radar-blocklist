@@ -42,13 +42,28 @@ Retry semantics (plan Global Constraints 「每块 3 次指数退避重试后仍
 抛异常」): initial attempt + 3 retries = 4 attempts total, backoff 2/4/8s,
 then raise. 4xx (except 429) is permanent — no retry. stats["requests"]
 counts ALL HTTP attempts, stats["retries"] counts attempts beyond the
-first (backoff and rate-limit waits alike), stats["rate_limited"] counts
-429 responses seen.
+first (backoff and rate-limit waits alike), stats["warming_waits"]
+counts 503-warming waits, stats["rate_limited"] counts 429 responses
+seen.
+
+Warming patience (T8, server-trial finding 2026-10-03): the 2-core 964Mi
+server engine cannot sustain the default pace (2500-IP chunks every 1.1s
+≈ 2300 lookups/s) and drops into a transient warming state — HTTP 503
+{"error": {code: "warming", ...}} needing ~a minute, which the generic
+5xx backoff (2/4/8s ≈ 14s total) cannot outwait. Such 503s sleep
+_WARMING_WAIT_S (60s) and retry the same chunk WITHOUT consuming the
+attempt budget, capped at _MAX_WARMING_EVENTS per run; an
+unreadable/non-JSON 503 body is ALSO treated as warming (one-shot nightly
+— safest interpretation, 宁等勿弃). The server deployment additionally
+slows the pace via env IPRADAR_REQUEST_INTERVAL_S (module-import read,
+default 1.1, clamp ≥ 0.1; see deploy/docker-compose.exporter.yml).
 """
 from __future__ import annotations
 
 import http.client
 import json
+import math
+import os
 import resource
 import sqlite3
 import sys
@@ -60,9 +75,33 @@ _STREAM_PATH = "/api/query/stream"
 _HTTP_TIMEOUT_S = 60
 # 3 次重试 → 共 4 次尝试(裁决 2026-10-03);测试注入 (0,0,0) 免真实等待
 _BACKOFF_SECONDS = (2.0, 4.0, 8.0)
+_WARMING_WAIT_S = 60.0             # 503 warming 单次等待:引擎预热分钟级,
+                                   # 通用 2/4/8s 退避(共 14s)不够耐心(T8)
+_MAX_WARMING_EVENTS = 5            # 单轮 warming 容忍上限:永不就绪响亮中止
 # 请求起点配速:引擎 keyed 桶 60/min(四查询端点共享)→ 1.1s 留裕量;
 # 测试注入 0 保持套件快速。间隔按请求 START 计,非完成时刻。
-MIN_REQUEST_INTERVAL_S = 1.1
+_REQUEST_INTERVAL_DEFAULT_S = 1.1  # 配速默认(即 keyed 桶 60/min 留裕量)
+_REQUEST_INTERVAL_MIN_S = 0.1      # 配速 clamp 下限:防误配 0/负值打穿限流桶
+
+
+def _request_interval_from_env(raw: str | None) -> float:
+    """env IPRADAR_REQUEST_INTERVAL_S 原始值 → 请求起点配速秒。缺失/非法/
+    非有限 → 默认 1.1;clamp 到 ≥ 0.1。纯函数(解析接缝,测试免 reimport);
+    导入期由下方 MIN_REQUEST_INTERVAL_S 赋值调用一次。"""
+    try:
+        value = float(raw)          # None/""/"abc" → 异常 → 走默认
+    except (TypeError, ValueError):
+        return _REQUEST_INTERVAL_DEFAULT_S
+    if not math.isfinite(value):
+        return _REQUEST_INTERVAL_DEFAULT_S
+    return max(value, _REQUEST_INTERVAL_MIN_S)
+
+
+# T8 服务器 trial 教训:2 核 964Mi 引擎吃不住默认 1.1s 配速(2500 IP/块
+# ≈ 2300 lookups/s)→ 503 warming;服务器 compose 经 env 覆写 2.2s ≈ 570
+# lookups/s ≈ 1h 全轮(见 deploy/docker-compose.exporter.yml)。
+MIN_REQUEST_INTERVAL_S = _request_interval_from_env(
+    os.environ.get("IPRADAR_REQUEST_INTERVAL_S"))
 _MAX_RATE_LIMIT_EVENTS = 10        # 单轮 429 容忍上限:楔死的限流器响亮中止
 _RETRY_AFTER_FALLBACK_S = 30.0     # 429 信封缺 retry_after 时的兜底等待
 
@@ -245,6 +284,19 @@ def _retry_after_seconds(exc: urllib.error.HTTPError) -> float:
     return _RETRY_AFTER_FALLBACK_S
 
 
+def _is_warming(exc: urllib.error.HTTPError) -> bool:
+    """503 是否引擎 warming 态(信封 code=="warming" 或 message 含
+    "warming",大小写不敏感)。正文不可读/非 JSON → True:一次性夜间轮,
+    把任何 503 都按 warming 等待是最安全的解释(宁等勿弃,T8)。"""
+    try:
+        err = json.loads(exc.read().decode("utf-8")).get("error") or {}
+        code = str(err.get("code") or "").lower()
+        message = str(err.get("message") or "").lower()
+        return code == "warming" or "warming" in message
+    except Exception:
+        return True
+
+
 class _RequestPacer:
     """请求起点配速:任意相邻两次请求 START 间隔 ≥ MIN_REQUEST_INTERVAL_S。
 
@@ -272,7 +324,9 @@ def _fetch_chunk_with_retries(url: str, anchors: list[str], units: list[str],
     2/4/8s, 4 attempts total, then ConsensusStreamError (caller aborts).
     429 is TRANSIENT — sleep the envelope's retry_after and retry the same
     chunk WITHOUT consuming the attempt budget (wedged limiter aborts after
-    _MAX_RATE_LIMIT_EVENTS events); every attempt starts through the pacer.
+    _MAX_RATE_LIMIT_EVENTS events); 503 warming likewise sleeps _WARMING_WAIT_S
+    (60s) and retries budget-free (engine never leaving warming aborts
+    after _MAX_WARMING_EVENTS events); every attempt starts through the pacer.
     4xx envelopes (401/403/...) are permanent — immediate raise."""
     attempt = 0
     failure: Exception | None = None
@@ -294,6 +348,16 @@ def _fetch_chunk_with_retries(url: str, anchors: list[str], units: list[str],
                         f" (>{_MAX_RATE_LIMIT_EVENTS}; wedged limiter?)"
                         " — aborting run") from exc
                 time.sleep(_retry_after_seconds(exc))
+                stats["retries"] += 1             # 首次之后的尝试(同口径)
+                continue
+            if exc.code == 503 and _is_warming(exc):   # 预热:同 429,不耗预算
+                stats["warming_waits"] += 1
+                if stats["warming_waits"] > _MAX_WARMING_EVENTS:
+                    raise ConsensusStreamError(
+                        f"warming {stats['warming_waits']} times"
+                        f" (>{_MAX_WARMING_EVENTS}; engine never leaves"
+                        " warming?) — aborting run") from exc
+                time.sleep(_WARMING_WAIT_S)        # 预热分钟级:60s 宁等勿弃
                 stats["retries"] += 1             # 首次之后的尝试(同口径)
                 continue
             if exc.code < 500:
@@ -332,12 +396,13 @@ def enrich_with_consensus(db: sqlite3.Connection, api_base: str, *,
     ≤2500 行 ≈ 几 MB)。max_rss_mb 是匿名内存红线(T7 口径:
     smaps_rollup `Anonymous:`,解析失败回退 ru_maxrss 并告警一次),默认
     140。返回 stats:{"queried", "malicious", "requests", "retries",
-    "rate_limited", "peak_rss_anon_mb", "elapsed_s"} — peak_rss_anon_mb
-    是逐块匿名采样的最大值(当前采样,非内核峰值)。
+    "rate_limited", "warming_waits", "peak_rss_anon_mb", "elapsed_s"} —
+    peak_rss_anon_mb 是逐块匿名采样的最大值(当前采样,非内核峰值)。
     """
     url = api_base.rstrip("/") + _STREAM_PATH
     stats: dict = {"queried": 0, "malicious": 0, "requests": 0,
-                   "retries": 0, "rate_limited": 0, "peak_rss_anon_mb": 0.0}
+                   "retries": 0, "rate_limited": 0, "warming_waits": 0,
+                   "peak_rss_anon_mb": 0.0}
     pacer = _RequestPacer()
     started = time.monotonic()
     while True:
