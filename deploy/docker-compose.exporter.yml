@@ -1,0 +1,67 @@
+# ip-radar 黑名单每日导出器(oneshot sidecar)——部署资产 Task 5。
+#
+# 不守护:绝不 `docker compose up`(profiles=export 已隔离);由
+# systemd timer(deploy/ipradar-blocklist.timer)或手工触发:
+#   docker compose -f deploy/docker-compose.exporter.yml --profile export run --rm blocklist-exporter
+#
+# 职责切分(定案):容器只**生成**产物进 /repo;PAT 推送在**宿主机**
+# push.sh 执行 —— token 永不进容器环境,故本文件无任何 secret。
+#
+# 镜像复用引擎 ipradar:latest(服务器已本地构建,零新构建;自带
+# python3.12 + lmdb 依赖)。注意:镜像 ENTRYPOINT(/entrypoint.sh)
+# 无条件 exec uvicorn 且无视 CMD,导出器必须覆写 entrypoint,否则
+# 容器会启动 API 服务而非导出。
+#
+# 内存:服务器共 964Mi(常驻仅 ~124Mi 可用)。150m 是 cgroup 硬顶,
+# 兜在 CLI 自身 --max-rss-mb 140(ru_maxrss 自检)之外作机器保险;
+# fail-small 原则:爆顶只死导出器,绝不拖垮引擎。restart: "no"——
+# 一次性日任务,卡死的导出器绝不能自旋,等下一轮 timer 即可。
+
+name: ipradar-blocklist
+
+services:
+  blocklist-exporter:
+    image: ipradar:latest
+    profiles: ["export"]        # 普通 `docker compose up` 永不启动它
+    mem_limit: 150m             # 964Mi 服务器:上限宁小勿大,爆顶死任务不死引擎
+    restart: "no"               # oneshot:卡死不循环(restart=any 都会自旋)
+    init: true                  # 收割子进程、正确转发 SIGTERM
+    entrypoint: ["python"]      # 覆写镜像 entrypoint(其硬编码 exec uvicorn)
+    working_dir: /repo
+    command:
+      - /repo/scripts/generate_blocklist.py
+      - --engine-path
+      - /app/backend
+      - --data-dir
+      - ${IPRADAR_DATA_DIR:-/opt/ip-lookup-tool/backend/data}
+      - --api-base
+      - http://ipradar:8000     # 引擎 compose 服务名即 `ipradar`(已核对引擎仓)
+      - --out-dir
+      - /repo
+      - --max-rss-mb
+      - "140"                   # 进程自检红线,略低于 150m cgroup 顶
+    environment:
+      # 引擎 registry 在 import 期消费 IP_RADAR_DATA_DIR;镜像 ENV 默认
+      # /app/data,必须显式对齐 --data-dir,防影子路径读错数据。
+      IP_RADAR_DATA_DIR: ${IPRADAR_DATA_DIR:-/opt/ip-lookup-tool/backend/data}
+    volumes:
+      # 仓根 rw:产物落这里;推送由宿主机 push.sh 之后执行(不在容器内)
+      - ..:/repo
+      # 引擎 LMDB 数据:宿主路径以**同一容器内路径**只读挂载(两侧一致),
+      # 保证引擎代码里的相对 ptr/sidecar 解析与引擎容器内完全相同。
+      - ${IPRADAR_DATA_DIR:-/opt/ip-lookup-tool/backend/data}:${IPRADAR_DATA_DIR:-/opt/ip-lookup-tool/backend/data}:ro
+      # 一致性挂载:镜像里烤了 /app/backend,仍把线上 backend 只读盖上,
+      # 确保引擎代码版本与写这份数据的引擎始终同版(引擎升级不掉拍)。
+      - ${IPRADAR_BACKEND_DIR:-/opt/ip-lookup-tool/backend}:/app/backend:ro
+    networks:
+      - ipradar
+
+networks:
+  ipradar:
+    # 引擎栈(ip-lookup-tool compose 项目)的 docker 网络;项目改名时用
+    # 环境变量 IPRADAR_NETWORK 覆盖。
+    name: ${IPRADAR_NETWORK:-ip-lookup-tool_default}
+    external: true
+    # 无需 extra_hosts:引擎容器以 compose 服务别名 `ipradar` 附着在本网络
+    # (已核对引擎仓 docker-compose.yml 服务键),Docker 内置 DNS 直接解析
+    # http://ipradar:8000 —— 写死 IP 反而脆弱。
