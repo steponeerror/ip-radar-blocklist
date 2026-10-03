@@ -207,6 +207,8 @@ def test_cli_end_to_end_publishes_tiers_and_merged_manifest(
     # 产物集恰为 10 档位文件 + manifest.json,.staging 已收尾
     assert {p.name for p in out_dir.iterdir()} == EXPECTED_ARTIFACTS
     assert not (out_dir / ".staging").exists()
+    # manifest 重写走 tmp + os.replace(原子),不留 .tmp 残渣
+    assert not (out_dir / "manifest.json.tmp").exists()
 
     # stdout manifest == 落盘 manifest;7 个 emit 必填字段 + CLI 合并 ctx
     on_disk = json.loads(
@@ -299,6 +301,8 @@ def test_cli_engine_always_500_writes_error_manifest_nothing_published(
     assert len(s.requests) == 4
     # 首跑无产物:out_dir 只有 error manifest,stdout 不打印成功 JSON
     assert [p.name for p in out_dir.iterdir()] == ["manifest.json"]
+    # error manifest 同样原子换入,无 .tmp 残渣
+    assert not (out_dir / "manifest.json.tmp").exists()
     payload = json.loads(
         (out_dir / "manifest.json").read_text(encoding="utf-8"))
     assert "engine on fire" in payload["error"]

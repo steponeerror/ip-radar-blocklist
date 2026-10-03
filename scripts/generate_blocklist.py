@@ -103,6 +103,16 @@ def _close_staging(staging: Path) -> None:
         pass
 
 
+def _unlink_manifest_tmp(out_dir: Path) -> None:
+    """Remove a stale manifest.json.tmp left by a run killed between the tmp
+    write and the os.replace — out_dir must only ever show manifest.json
+    (+ tier files) to consumers (mirrors stale work.db startup cleanup)."""
+    try:
+        (out_dir / "manifest.json.tmp").unlink()
+    except OSError:
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     out_dir = Path(args.out_dir)
@@ -114,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     db: sqlite3.Connection | None = None
     try:
         stage = "staging"
+        _unlink_manifest_tmp(out_dir)     # kill 残留的 tmp(同陈旧 work.db 清理)
         staging.mkdir(parents=True, exist_ok=True)
         _unlink_work_db(staging)          # 中止轮次的陈旧 work.db
         db = sqlite3.connect(staging / "work.db")
@@ -154,7 +165,8 @@ def main(argv: list[str] | None = None) -> int:
         _close_staging(staging)
 
         # LEDGER RULING(T3 review):emit_tiers 成功 manifest 无 ctx 透传 —
-        # 合并进其返回的 dict 并在原子发布后重写 manifest.json 本体。
+        # 合并进其返回的 dict 并原子换入重写 manifest.json 本体(tmp +
+        # os.replace,同 emit_tiers 发布路径:kill/ENOSPC 决不留撕裂文件)。
         stage = "manifest"
         manifest.update({
             "walk_stats": walk_stats,
@@ -163,8 +175,10 @@ def main(argv: list[str] | None = None) -> int:
             "peak_rss_mb": round(consensus_client._current_rss_mb(), 1),
             "api_base": args.api_base,
         })
-        (out_dir / "manifest.json").write_text(
+        tmp = out_dir / "manifest.json.tmp"
+        tmp.write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, out_dir / "manifest.json")
         print(json.dumps(manifest, indent=2))
         return 0
     except Exception as exc:              # 任何阶段:响亮失败,不碰已发布产物

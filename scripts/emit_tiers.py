@@ -155,9 +155,12 @@ def write_error_manifest(out_dir: Path, error: str, **ctx) -> None:
     """失败契约:仅覆写 manifest.json(error + **ctx 透传 + generated_at),
     绝不碰其他产物文件——消费者从此读到显式错误态,而非半新半旧产物。
     Task 4 在任何管线失败路径调用(walk/enrich stats 等经 **ctx 传入)。
+    写入走 tmp + os.replace(同发布路径):kill/ENOSPC 也不留撕裂 manifest。
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {"error": error, **ctx, "generated_at": _utc_now_iso()}
-    (out_dir / "manifest.json").write_text(
+    tmp = out_dir / "manifest.json.tmp"
+    tmp.write_text(
         json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, out_dir / "manifest.json")
