@@ -29,13 +29,9 @@ if [[ "$TAG_STATUS" == "200" ]]; then
     exit 0
 fi
 
-# 池摘要(Release body)
+# 池摘要(Release body;\n 是 JSON 转义换行——裸换行会让 JSON 非法 400)
 POOL=$(python3 -c "import json; print(json.load(open('manifest.json')).get('malicious_pool','?'))" 2>/dev/null || echo "?")
-BODY="Daily IP blocklist export from the ip-radar consensus engine.
-
-- Malicious pool: ${POOL} entries
-- Tiers: 100 / 500 / 1000 / 5000 / 10000 (nested)
-- Generated: ${DATE} (UTC)"
+BODY="Daily IP blocklist export from the ip-radar consensus engine.\n\n- Malicious pool: ${POOL} entries\n- Tiers: 100 / 500 / 1000 / 5000 / 10000 (nested)\n- Generated: ${DATE} (UTC)"
 
 # 创建 Release
 RELEASE_RESP=$(curl -sf -X POST \
