@@ -2,9 +2,9 @@
 
 Daily tiered IP blocklist generated from the
 [ip-radar](https://github.com/steponeerror/ip-radar) threat-intelligence engine —
-44 sources, consensus verdicts, all evidence recomputed before export.
+40 sources, consensus verdicts, all evidence recomputed before export.
 
-> ip-radar 威胁情报引擎的每日阶梯黑名单导出：44 源聚合、全源共识判定，供防火墙 / fail2ban / 研究直接取用。
+> ip-radar 威胁情报引擎的每日阶梯黑名单导出：40 源聚合、全源共识判定，供防火墙 / fail2ban / 研究直接取用。
 
 ## Download
 
@@ -23,7 +23,7 @@ Swap `top_100` for `top_500` / `top_1000` / `top_5000` / `top_10000`, or `.csv` 
 | File | Content |
 |---|---|
 | `top_100.txt` … `top_10000.txt` | Pure list: one IP or CIDR per line (IPv4 + IPv6 mixed) |
-| `top_100.csv` … `top_10000.csv` | Same entries with full context (9 columns) |
+| `top_100.csv` … `top_10000.csv` | Same entries with full context (8 columns) |
 | `manifest.json` | generated_at, per-tier row counts, pool size, run stats |
 
 Tiers are nested: `top_100 ⊂ top_500 ⊂ top_1000 ⊂ top_5000 ⊂ top_10000`.
