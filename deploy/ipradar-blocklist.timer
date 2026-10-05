@@ -1,12 +1,14 @@
-# 每日 04:30 触发 ipradar-blocklist.service(oneshot 导出 + 推送)。
-# 安装与启用见 deploy/ipradar-blocklist.service 头注。
+# 每日 UTC 22:00 触发(北京 06:00 起跑,+实测整轮 ~2.5h ≈ 北京 08:30 前后发布,
+# 确保 9 点可查)。安装与启用见 deploy/ipradar-blocklist.service 头注。
 
 [Unit]
 Description=Nightly trigger for ipradar-blocklist export
 
 [Timer]
-# 对齐摄取完成时间再调
-OnCalendar=*-*-* 04:30:00
+# UTC 后缀免疫宿主冬令时切换(CEST↔CET 漂移 1h)。
+# 摄取为滚动节奏(各源独立周期全天分布,2026-10-05 日志实证),
+# 无集中完成点可对齐,任意起跑时刻数据等效新鲜。
+OnCalendar=*-*-* 22:00:00 UTC
 # 停机跨过触发点 → 开机补跑一轮,不空窗
 Persistent=true
 Unit=ipradar-blocklist.service
