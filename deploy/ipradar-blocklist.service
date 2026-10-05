@@ -25,7 +25,10 @@ TimeoutStartSec=4h
 ExecStart=/usr/bin/docker compose -f /opt/ip-radar-blocklist/deploy/docker-compose.exporter.yml --profile export run --rm blocklist-exporter
 
 # 推送:仅在生成成功后于宿主机执行(PAT 只在宿主机,永不进容器)。
-ExecStartPost=/opt/ip-radar-blocklist/deploy/push.sh
+# RELEASE_DATE 覆盖为北京日期:push.sh 默认 UTC 日期,而 21:00 UTC 起跑的轮次
+# 在 UTC 仍属前一日,不覆盖会让北京早间发布的 tag 恒晚一天。
+# (%%F 的双 % 是 systemd 单元文件对字面 % 的转义。)
+ExecStartPost=/bin/sh -c 'RELEASE_DATE=$(TZ=Asia/Shanghai date +%%F) /opt/ip-radar-blocklist/deploy/push.sh'
 
 # 夜间批活,压到最低优先级,不与引擎抢 CPU/IO
 Nice=19
