@@ -30,6 +30,10 @@ ExecStart=/usr/bin/docker compose -f /opt/ip-radar-blocklist/deploy/docker-compo
 # (%%F 的双 % 是 systemd 单元文件对字面 % 的转义。)
 ExecStartPost=/bin/sh -c 'RELEASE_DATE=$(TZ=Asia/Shanghai date +%%F) /opt/ip-radar-blocklist/deploy/push.sh'
 
+# 发推:Release 成功后紧跟(当天已发过则 tweet.py 自身 state 防重跳过)。
+# 失败语义:重试一次后 exit 1 → 本单元 failed(journal 可见),不影响已发布的 Release。
+ExecStartPost=/usr/bin/python3 /opt/ip-radar-blocklist/deploy/tweet.py
+
 # 夜间批活,压到最低优先级,不与引擎抢 CPU/IO
 Nice=19
 CPUSchedulingPolicy=idle
