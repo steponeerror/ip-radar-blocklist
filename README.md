@@ -2,9 +2,9 @@
 
 Daily tiered IP blocklist generated from the
 [ip-radar](https://github.com/steponeerror/ip-radar) threat-intelligence engine —
-40 sources, consensus verdicts, all evidence recomputed before export.
+41 sources, consensus verdicts, all evidence recomputed before export.
 
-> ip-radar 威胁情报引擎的每日阶梯黑名单导出：40 源聚合、全源共识判定，供防火墙 / fail2ban / 研究直接取用。
+> ip-radar 威胁情报引擎的每日阶梯黑名单导出：41 源聚合、全源共识判定，供防火墙 / fail2ban / 研究直接取用。
 
 ## Download
 
