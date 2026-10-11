@@ -10,7 +10,7 @@ REPO_API="https://api.github.com/repos/steponeerror/ip-radar-blocklist"
 TOKEN="${BLOCKLIST_PUSH_TOKEN:-$(cat /root/.config/blocklist-push.token)}"
 DATE="${RELEASE_DATE:-$(date -u +%Y-%m-%d)}"
 TAG="v${DATE}"
-FILES=(top_100.txt top_100.csv top_500.txt top_500.csv top_1000.txt top_1000.csv top_5000.txt top_5000.csv top_10000.txt top_10000.csv manifest.json)
+FILES=(top_100.txt top_100.csv top_500.txt top_500.csv top_1000.txt top_1000.csv top_5000.txt top_5000.csv top_10000.txt top_10000.csv)
 
 cd "$REPO_DIR"
 
