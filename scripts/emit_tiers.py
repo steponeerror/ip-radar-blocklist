@@ -2,8 +2,9 @@
 """档位产出器 — sorted malicious pool → nested top_N.{txt,csv} + manifest.
 
 Nightly blocklist pipeline stage 3 (plan 2026-10-03-blocklist-pipeline-v1
-T3): rank the enriched units 表 (verdict == "malicious" only) by the Global
-Constraints key chain (Q2-B 全源口径) and slice nested supersets per tier —
+T3): rank the enriched units 表 (verdict == "malicious" AND is_cidr
+= 0 — 单 IP 口径,2026-10-25 起) by the Global Constraints key chain
+(Q2-B 全源口径) and slice nested supersets per tier —
 every tier re-runs the SAME single sorted SQL with only a different LIMIT,
 so tier files are guaranteed-consistent prefixes of one ranking. Files
 always exist ("up to N"): pool smaller than a tier → fewer rows; pool 0 →
@@ -36,10 +37,13 @@ CSV_HEADER = ("ip", "asn", "country", "classes", "confidence",
 # last_seen NULLS LAST(SQLite 无 NULLS LAST 关键字,`last_seen IS NULL`
 # 得 0/1,ASC 即非 NULL 在前)→ last_seen DESC 最新优先 → ip ASC 终键保
 # 跨轮确定性。全档位共用,仅 LIMIT 不同 → 嵌套超集恒成立。
+# is_cidr = 0(2026-10-25 口径):档位一行一个单 IP — 上游原生 CIDR
+# 单元(spamhaus DROP/firehol 聚合段)不展开、不进档;池内 CIDR
+# 计数仍由 manifest.cidr_units 观测,不静默。
 _TIER_SQL = f"""
 SELECT {", ".join(CSV_HEADER)}
 FROM units
-WHERE verdict = 'malicious'
+WHERE verdict = 'malicious' AND is_cidr = 0
 ORDER BY source_count DESC, confidence DESC,
          last_seen IS NULL ASC, last_seen DESC, ip ASC
 LIMIT ?
@@ -65,8 +69,9 @@ def _write_tier(db: sqlite3.Connection, txt_path: Path, csv_path: Path,
                 limit: int) -> int:
     """Stream the LIMIT-n sorted cursor → txt + csv. Returns rows written.
 
-    txt:每行 ip 列原文(CIDR/v6 混装),无表头无注释,行尾 LF、EOF 恰一
-    换行;csv:表头逐字 9 列,QUOTE_MINIMAL(逗号字段自动引),NULL → ""。
+    txt:每行单个 IP(v4/v6 纯地址;CIDR 单元已被档位 SQL 过滤),无表
+    头无注释,行尾 LF、EOF 恰一换行;csv:表头逐字 8 列,QUOTE_MINIMAL
+    (逗号字段自动引),NULL → ""。
     """
     rows = 0
     with open(txt_path, "w", encoding="utf-8", newline="\n") as tf, \
@@ -81,7 +86,8 @@ def _write_tier(db: sqlite3.Connection, txt_path: Path, csv_path: Path,
 
 
 def _verify_staged(staging: Path, tiers: tuple, pool: int) -> None:
-    """发布前校验:每档 staged 落盘行数 = min(N, 池)。任何不符 → 不换入。"""
+    """发布前校验:每档 staged 落盘行数 = min(N, 单 IP 池)。任何不符
+    → 不换入。"""
     for n in tiers:
         expected = min(n, pool)
         with open(staging / f"top_{n}.txt", "rb") as f:
@@ -94,7 +100,7 @@ def _verify_staged(staging: Path, tiers: tuple, pool: int) -> None:
         if txt_rows != expected or csv_rows != expected:
             raise RuntimeError(
                 f"tier {n}: staged txt={txt_rows} csv={csv_rows} rows,"
-                f" expected {expected} (malicious pool={pool})"
+                f" expected {expected} (single-IP malicious pool={pool})"
                 " — refusing to publish")
 
 
@@ -104,7 +110,7 @@ def emit_tiers(db: sqlite3.Connection, out_dir: Path, *,
     """Rank the malicious pool, slice nested tiers, atomically publish.
 
     写 <staging>/top_N.{txt,csv}(staging 默认 <out_dir>/.staging)→ 逐档
-    校验行数 = min(N, 恶意池) → 逐文件 os.replace 换入 out_dir,
+    校验行数 = min(N, 单 IP 恶意池) → 逐文件 os.replace 换入 out_dir,
     manifest.json 最后落(消费者可见提交点)→ staging 收尾(我方文件已随
     replace 移走,他人内容不动,仅尽力 rmdir)。返回 manifest dict;
     异常向上抛(staging 残留由调方处置,见 Task 4 error 路径)。
@@ -117,11 +123,13 @@ def emit_tiers(db: sqlite3.Connection, out_dir: Path, *,
 
     pool = _scalar(db, "SELECT COUNT(*) FROM units"
                        " WHERE verdict = 'malicious'")
+    single_pool = _pool_count(db, "is_cidr = 0")   # 档位实际切档的池
     manifest = {
         "generated_at": _utc_now_iso(),
         "tiers": {},
         "universe": _scalar(db, "SELECT COUNT(*) FROM units"),
         "malicious_pool": pool,
+        "malicious_single_ip": single_pool,
         "cidr_units": _pool_count(db, "is_cidr = 1"),
         "units_v6": _pool_count(db, "is_v6 = 1"),
         "first_seen_coverage": _pool_count(
@@ -133,7 +141,7 @@ def emit_tiers(db: sqlite3.Connection, out_dir: Path, *,
         manifest["tiers"][str(n)] = _write_tier(
             db, staging / f"top_{n}.txt", staging / f"top_{n}.csv", n)
 
-    _verify_staged(staging, tiers, pool)
+    _verify_staged(staging, tiers, single_pool)
 
     manifest_path = staging / "manifest.json"
     manifest_path.write_text(

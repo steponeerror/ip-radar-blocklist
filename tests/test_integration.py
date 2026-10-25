@@ -14,9 +14,10 @@ Fixture strategy = T1's real-shard 手法 + T2's real-protocol stub 手法:
   all observed from outside, exactly as cron/systemd would see them.
 
 Universe (7 units, shaped): 4 v4 /32 + 1 v6 /128 (dataplane raw) + 1 v4 CIDR
-+ 1 v6 CIDR (turris csv) → stub verdicts: 4 malicious (including the v6 line
-and the v4-CIDR line that must surface in every tier), 1 suspicious, 2
-benign — none of the latter may appear in any artifact.
++ 1 v6 CIDR (turris csv) → stub verdicts: 4 malicious (including the v6
+line; the v4-CIDR line stays counted in the pool but must NOT surface in
+any tier — 单 IP 口径, 2026-10-25), 1 suspicious, 2 benign — none of
+the latter may appear in any artifact.
 
 Auth (final-review P1): the stub optionally enforces the engine's key gate
 (`required_key=`) — happy path runs the CLI WITH --api-key against a
@@ -41,10 +42,9 @@ DEFAULT_TIERS = (100, 500, 1000, 5000, 10000)
 EXPECTED_ARTIFACTS = {f"top_{n}.{ext}" for n in DEFAULT_TIERS
                       for ext in ("txt", "csv")} | {"manifest.json"}
 
-# 排序全链端到端期望:sc=3 > sc=2 > (sc=1, conf 同分 60:last_seen
-# 非 NULL 在前、turris CIDR 的 NULL LAST 殿后)
-EXPECTED_ORDER = ["203.0.113.7", "203.0.113.5",
-                  "2001:db8::1", "198.51.100.0/24"]
+# 排序全链端到端期望:sc=3 > sc=2 > sc=1(单 IP 口径:turris v4-CIDR
+# 恶意单元在池内但被档位排除)
+EXPECTED_ORDER = ["203.0.113.7", "203.0.113.5", "2001:db8::1"]
 
 DATA_PLANE_ROWS = [
     "1513399|TEST AS|203.0.113.7|2026-10-05T00:00:00Z|sshpwauth",
@@ -243,17 +243,19 @@ def test_cli_end_to_end_publishes_tiers_and_merged_manifest(
     assert on_disk == manifest
     assert "error" not in manifest
     for field in ("generated_at", "tiers", "universe", "malicious_pool",
-                  "cidr_units", "units_v6", "first_seen_coverage",
+                  "malicious_single_ip", "cidr_units", "units_v6",
+                  "first_seen_coverage",
                   "walk_stats", "enrich_stats", "elapsed_s", "peak_rss_mb",
                   "peak_rss_anon_mb", "api_base"):
         assert field in manifest, field
     assert manifest["universe"] == 7
     assert manifest["malicious_pool"] == 4
+    assert manifest["malicious_single_ip"] == 3   # 档位实际切档的池
     assert manifest["cidr_units"] == 1            # 198.51.100.0/24(池内)
     assert manifest["units_v6"] == 1              # 2001:db8::1(池内)
     assert manifest["first_seen_coverage"] == pytest.approx(3 / 4)
     assert manifest["walk_stats"]["first_seen_coverage"] == pytest.approx(5 / 7)
-    assert manifest["tiers"] == {str(n): 4 for n in DEFAULT_TIERS}
+    assert manifest["tiers"] == {str(n): 3 for n in DEFAULT_TIERS}
     assert manifest["walk_stats"]["units_total"] == 7
     assert manifest["walk_stats"]["units_v6"] == 2
     assert manifest["walk_stats"]["cidr_units"] == 2
@@ -279,7 +281,7 @@ def test_cli_end_to_end_publishes_tiers_and_merged_manifest(
         "203.0.113.7", "203.0.113.5", "198.51.100.5", "192.0.2.1",
         "2001:db8::1", "198.51.100.0", "2001:db8:aaaa::"])
 
-    # 字节级钉死排序全链 + CIDR 行与 v6 行在产物里 + up to N(池 4)
+    # 字节级钉死排序全链 + v6 行在产物里、CIDR 被档位排除 + up to N(单 IP 池 3)
     expected_txt = ("\n".join(EXPECTED_ORDER) + "\n").encode("utf-8")
     for n in DEFAULT_TIERS:
         assert (out_dir / f"top_{n}.txt").read_bytes() == expected_txt
@@ -287,18 +289,17 @@ def test_cli_end_to_end_publishes_tiers_and_merged_manifest(
     assert raw_csv.split(b"\n")[0] == (b"ip,asn,country,classes,confidence,"
                                        b"source_count,first_seen,"
                                        b"last_seen")
-    # CIDR 行写单元原文(锚点二象性),turris 无 first_seen/last_seen → 双空尾
-    assert ('198.51.100.0/24,64512,US,spam,80,1,,'
-            in (out_dir / "top_100.csv").read_text(encoding="utf-8"))
     # dataplane 双填 first_seen = last_seen → 含 first_seen 值的行
     assert ("2001:db8::1,64512,US,bruteforce,80,1,"
             "2026-10-03T00:00:00Z,2026-10-03T00:00:00Z"
             in (out_dir / "top_100.csv").read_text(encoding="utf-8"))
 
-    # suspicious / benign 单元绝不出现在任何产物
+    # suspicious / benign 单元绝不出现在任何产物;CIDR 恶意单元同样被
+    # 档位排除(单 IP 口径),只在 manifest 计数里可见
     for name in EXPECTED_ARTIFACTS - {"manifest.json"}:
         body = (out_dir / name).read_text(encoding="utf-8")
-        for absent in ("198.51.100.5", "192.0.2.1", "2001:db8:aaaa::/48"):
+        for absent in ("198.51.100.5", "192.0.2.1", "2001:db8:aaaa::/48",
+                       "198.51.100.0/24"):
             assert absent not in body, (name, absent)
 
 

@@ -128,7 +128,8 @@ class ConsensusStreamError(RuntimeError):
 def query_key(unit_ip: str) -> str:
     """单元 → 锚点查询键:CIDR 剥 /前缀(网络地址调 API),纯 IP 原样。
 
-    产物行仍写单元原文(锚点二象性,Q3-A:共识取锚点,存储/出档取 CIDR)。
+    产物行仍写单元原文(锚点二象性,Q3-A:共识取锚点,存储取 CIDR;
+    2026-10-25 起档位只出单 IP,CIDR 单元不进档)。
     """
     return unit_ip.partition("/")[0]
 

@@ -22,7 +22,7 @@ Swap `top_100` for `top_500` / `top_1000` / `top_5000` / `top_10000`, or `.csv` 
 
 | File | Content |
 |---|---|
-| `top_100.txt` … `top_10000.txt` | Pure list: one IP or CIDR per line (IPv4 + IPv6 mixed) |
+| `top_100.txt` … `top_10000.txt` | Pure list: one single IP per line (IPv4 + IPv6 mixed, no CIDR netblocks) |
 | `top_100.csv` … `top_10000.csv` | Same entries with full context (8 columns) |
 
 Tiers are nested: `top_100 ⊂ top_500 ⊂ top_1000 ⊂ top_5000 ⊂ top_10000`.
@@ -35,7 +35,7 @@ honest signal). Updated daily.
 ip,asn,country,classes,confidence,source_count,first_seen,last_seen
 ```
 
-- `ip` — single IP or CIDR, exactly as recorded by the engine
+- `ip` — single IP (v4 or v6); CIDR units are counted in the manifest but excluded from tiers
 - `classes` — threat categories (`;`-joined, e.g. `brute-force;scanner`)
 - `confidence` — engine consensus confidence, 0–100
 - `source_count` — how many independent sources flagged it
@@ -46,9 +46,11 @@ Entries are ranked by **source_count ↓, confidence ↓, recency ↓** — the 
 
 ## Selection
 
-An IP/CIDR enters the list only when the engine's fused consensus verdict is
+An IP enters the list only when the engine's fused consensus verdict is
 **malicious** (suspicious-only entries are excluded). No aggregation, no range
-expansion — units are exported at the granularity the sources recorded them.
+expansion. Sources that publish whole netblocks (e.g. Spamhaus DROP, FireHOL
+aggregates) are counted in the manifest (`cidr_units`) but excluded from the
+tier files, which carry single IPs only — one IP per line.
 
 ## Usage
 

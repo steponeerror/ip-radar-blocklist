@@ -3,8 +3,10 @@
 Fixture strategy: pure sqlite (engine untouched — T3 only reads the
 post-T1+T2 enriched units 表, no LMDB, no API). 11 rows: 8 malicious
 exercising every sort-key branch (source_count DESC, confidence DESC,
-last_seen NULLS LAST, ip ASC tie pair) plus v6 / v4-CIDR / NULL-text-field
-shapes, + 2 suspicious + 1 benign that must never leak into any artifact.
+last_seen NULLS LAST, ip ASC) plus v6 / NULL-text-field shapes, + 2
+v4-CIDR malicious rows that must stay EXCLUDED from every tier (单 IP
+口径, 2026-10-25) + 2 suspicious + 1 benign that must never leak into
+any artifact.
 """
 import csv
 import json
@@ -21,7 +23,8 @@ sys.path.insert(0, str(REPO_ROOT))          # scripts/ as namespace pkg portion
 from scripts import emit_tiers              # noqa: E402 (stdlib-only: pre-env safe)
 
 MANDATORY_FIELDS = {"generated_at", "tiers", "universe", "malicious_pool",
-                    "cidr_units", "units_v6", "first_seen_coverage"}
+                    "malicious_single_ip", "cidr_units", "units_v6",
+                    "first_seen_coverage"}
 DEFAULT_TIERS = (100, 500, 1000, 5000, 10000)
 
 UNITS_DDL = """
@@ -42,16 +45,16 @@ CREATE TABLE units(
 """
 
 # 排序全链预期(Q2-B):sc DESC → conf DESC → last_seen NULLS LAST →
-# last_seen DESC → ip ASC(同分对 "198.51.100.0/24" < "2001:db8::1")。
+# last_seen DESC → ip ASC。单 IP 口径(2026-10-25):两个 CIDR 恶意单元
+# (203.0.113.0/24 sc=3、198.51.100.0/24 sc=1)留在 fixture 钉“必须被
+# 排除”,不进 EXPECTED_ORDER。
 EXPECTED_ORDER = [
     "203.0.113.10",        # sc=4 — 唯一最高源数
     "203.0.113.20",        # sc=3, conf=90 — confidence DESC 胜出
-    "203.0.113.0/24",      # sc=3, conf=60
     "203.0.113.40",        # sc=2, conf=70, ls=10-06 — last_seen DESC 最新
     "203.0.113.50",        # sc=2, conf=70, ls=10-02
     "203.0.113.60",        # sc=2, conf=70, ls=NULL — NULLS LAST
-    "198.51.100.0/24",     # sc=1, conf=50, ls=NULL — 同分对 ip ASC('1'<'2')
-    "2001:db8::1",         # 同分对另一端(v6 纯地址)
+    "2001:db8::1",         # sc=1(v6 纯地址;同组 CIDR 已被排除)
 ]
 
 
@@ -143,9 +146,10 @@ def test_pool_smaller_than_tiers_up_to_n(db, out_dir):
     for n in DEFAULT_TIERS:
         for suffix in ("txt", "csv"):
             assert (out_dir / f"top_{n}.{suffix}").exists(), (n, suffix)
-        # 池 8 < 任何档位 → 每个文件恰 8 行("up to N",行数即真实数)
-        assert (out_dir / f"top_{n}.txt").read_text().count("\n") == 8
-    assert manifest["tiers"] == {str(n): 8 for n in DEFAULT_TIERS}
+        # 单 IP 池 6 < 任何档位 → 每档恰 6 行("up to N",行数即真实数;
+        # 池内另有 2 个 CIDR 恶意单元不进档)
+        assert (out_dir / f"top_{n}.txt").read_text().count("\n") == 6
+    assert manifest["tiers"] == {str(n): 6 for n in DEFAULT_TIERS}
 
 
 def test_tiers_are_nested_prefixes(db, out_dir):
@@ -168,12 +172,13 @@ def test_manifest_fields_and_file_agreement(db, out_dir):
     assert MANDATORY_FIELDS <= set(manifest)
     assert "error" not in manifest
     assert manifest["universe"] == 11              # 8 malicious + 2 sus + 1 ben
-    assert manifest["malicious_pool"] == 8
+    assert manifest["malicious_pool"] == 8         # 全池(含 2 个 CIDR)
+    assert manifest["malicious_single_ip"] == 6    # 档位实际切档的池
     assert manifest["cidr_units"] == 2             # 203.0.113.0/24, 198.51.100.0/24
     assert manifest["units_v6"] == 1               # 2001:db8::1
     assert manifest["first_seen_coverage"] == pytest.approx(3 / 8)  # 非空占比
-    # suspicious/benign 不进任何口径
-    assert set(manifest["tiers"].values()) == {8}
+    # suspicious/benign 不进任何口径;CIDR 不进档但仍在池计数
+    assert set(manifest["tiers"].values()) == {6}
     ts = datetime.fromisoformat(manifest["generated_at"])
     assert ts.utcoffset() == timedelta(0)          # ISO 8601 UTC
 
@@ -188,9 +193,9 @@ def test_custom_staging_dir_publishes_to_out_dir(db, out_dir, tmp_path):
     custom = tmp_path / "elsewhere" / "staging"
     manifest = emit_tiers.emit_tiers(db, out_dir, staging_dir=custom)
     assert manifest["malicious_pool"] == 8
-    assert (out_dir / "top_100.txt").read_text().count("\n") == 8
+    assert (out_dir / "top_100.txt").read_text().count("\n") == 6
     assert json.loads(
-        (out_dir / "manifest.json").read_text())["tiers"]["100"] == 8
+        (out_dir / "manifest.json").read_text())["tiers"]["100"] == 6
     assert not (out_dir / ".staging").exists()     # 默认 staging 从未创建
     assert not custom.exists() or not any(custom.iterdir())
 
@@ -209,6 +214,24 @@ def test_empty_pool_zero_byte_txt_and_header_only_csv(out_dir):
     assert manifest["malicious_pool"] == 0
     assert manifest["first_seen_coverage"] == 0.0   # 除零守卫
     assert manifest["universe"] == 2
+    assert manifest["tiers"] == {str(n): 0 for n in DEFAULT_TIERS}
+
+
+def test_cidr_only_pool_yields_empty_tiers(out_dir):
+    """全 CIDR 恶意池边界:池计数非零,但档位一行都不出(单 IP 口径)。"""
+    conn = sqlite3.connect(":memory:")
+    conn.execute(UNITS_DDL)
+    _insert(conn, "203.0.113.0/24", verdict="malicious", is_cidr=1,
+            source_count=9, confidence=99)
+    manifest = emit_tiers.emit_tiers(conn, out_dir)
+    for n in DEFAULT_TIERS:
+        assert (out_dir / f"top_{n}.txt").read_bytes() == b""
+        assert (out_dir / f"top_{n}.csv").read_bytes() == (
+            b"ip,asn,country,classes,confidence,"
+            b"source_count,first_seen,last_seen\n")
+    assert manifest["malicious_pool"] == 1       # 池内有它
+    assert manifest["malicious_single_ip"] == 0  # 档位没有它
+    assert manifest["cidr_units"] == 1
     assert manifest["tiers"] == {str(n): 0 for n in DEFAULT_TIERS}
 
 
