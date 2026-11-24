@@ -40,7 +40,9 @@ cd /opt/ip-radar-blocklist
 docker compose -f deploy/docker-compose.exporter.yml --profile export config -q
 
 # 3. 核对引擎镜像含按键序扫描器(#444 A 步);没有就先部署引擎、重建镜像
-docker run --rm --entrypoint python ipradar:latest -c "import ipdb._scan; print('ok')"
+docker run --rm --network none -w /app/backend --entrypoint python ipradar:latest \
+  -c "import ipdb._scan; print('ok')"
+#   (镜像的工作目录是 /app,引擎代码在 /app/backend,所以要 -w;导出器自己会把这个路径加进 sys.path)
 
 # 4. 核对引擎数据卷存在且非空(默认假定 ip-lookup-tool_ipradar-data)
 docker volume inspect ip-lookup-tool_ipradar-data --format '{{.Mountpoint}}'
