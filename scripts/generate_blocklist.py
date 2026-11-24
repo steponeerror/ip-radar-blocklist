@@ -71,22 +71,28 @@ _MISMATCH_EXAMPLES = 10
 
 
 class GeoMismatchError(RuntimeError):
-    """geo 阶段判定核对失败。looked_up = 停下之前查过的 IP 数,
-    examples = 不一致的例子(最多 _MISMATCH_EXAMPLES 条);失败清单带上
-    这两个值(#444 评审 P3-7)。"""
+    """geo 阶段判定核对失败。失败清单里带上这些值(原 #444 评审 P3-7;
+    后四项 2026-11-25 加):looked_up = 停下之前查过的 IP 数;examples =
+    不一致的例子(最多 _MISMATCH_EXAMPLES 条,每条带两边的值);verified =
+    其中逐列核对过的 IP 数(其余是被跳过的和这些不一致的);
+    peak_rss_anon_mb = 这一段到停下时的匿名内存峰值;changed_sources =
+    扫描之后纪元变了的源;drift_skipped / drift_examples = 因为证据涉及
+    这些源而只核对了一部分(或没核对)的地址数和例子。"""
 
     def __init__(self, message: str, *, looked_up: int,
-                 examples: list[str], changed_sources: list[str] = (),
+                 examples: list[str], verified: int = 0,
+                 peak_rss_anon_mb: float = 0.0,
+                 changed_sources: list[str] | None = None,
                  drift_skipped: int = 0,
-                 drift_examples: list[str] = ()):
+                 drift_examples: list[str] | None = None):
         super().__init__(message)
         self.looked_up = looked_up
-        self.examples = examples
-        # 扫描之后被重建过的源,以及因此只核对了未重建部分的地址
-        # (#444 生产试跑 2026-11-25);失败清单里一并带出
-        self.changed_sources = list(changed_sources)
+        self.examples = list(examples)
+        self.verified = verified
+        self.peak_rss_anon_mb = peak_rss_anon_mb
+        self.changed_sources = list(changed_sources or [])
         self.drift_skipped = drift_skipped
-        self.drift_examples = list(drift_examples)
+        self.drift_examples = list(drift_examples or [])
 
 
 def _names(text: str | None) -> set[str]:
@@ -94,13 +100,19 @@ def _names(text: str | None) -> set[str]:
     return set(text.split(";")) - {""} if text else set()
 
 
+def _short(value, limit: int = 200) -> str:
+    """例子里的值:repr 之后截到 limit 个字符(清单里一行别太长)。"""
+    text = repr(value)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 def _sources_changed_since_scan(epochs: dict, sources) -> set[str]:
     """扫描开跑之后被重建过的源名集合。
 
     epochs = 扫描时钉住的各库纪元号(清单 scan_stats.epochs,来自扫描器
     open_unit_scanner);现在的纪元号读 ptr 文件。两边不同 = 这个源在扫描
-    期间换过纪元(也可能已经不在启用名单里)。epochs 为空(调用方没给)
-    → 空集,核对保持逐列严格。"""
+    开跑之后换过纪元,或者已经不在启用名单里 —— 下文统称「被重建过的
+    源」。epochs 为空(调用方没给)→ 空集,核对保持逐列严格。"""
     from ipdb._sources._lmdb import read_ptr
     by_name = {s.name: s for s in sources}
     changed: set[str] = set()
@@ -203,13 +215,19 @@ def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float,
     扫描期间源被重建(#444 生产试跑 2026-11-25):扫描读的是开跑时钉住
     的纪元,这里 lookup() 读的是现在的纪元。生产上扫描要跑一个多小时,
     引擎照常重建源,所以两边读到的不是同一份数据的情况每轮都可能有。
-    epochs(扫描时钉住的纪元)与现在的 ptr 不同 = 这个源被重建过。对不上
-    的地址分两种:
+    对不上的地址分两种:
       - 证据(入库的 sources ∪ 查询接口的 sources)里有被重建过的源:
-        把被重建的源从两边去掉再比 —— 查询接口只算没重建的源
-        (allowed_sources 减去它们),其源名集合必须等于入库 sources 减去
-        它们,其分类集合必须是入库 classes 的子集;满足 = 这个地址只核对
-        了没重建的那部分(drift_skipped 计数、记例子),不中止。
+        把被重建的源从两边去掉再核对没重建的那部分。按观测比,不按五列
+        比 —— 入库 sources 里有和指控者同组的证人(例如基础设施地址的
+        良性断言),指控者被去掉后组就不算恶意组,证人也就不在查询接口
+        的 sources 里,按五列比会把该过的地址判成对不上(评审 P2-1)。
+        没重建的源在查询接口的观测里:verdict 为 malicious 的源名集合
+        须是入库 sources 去掉被重建源之后的子集(扫描没漏指控者);入库
+        sources 去掉被重建源之后须落在这些观测的源名里(入库没有多出
+        查询接口看不到的源);malicious 观测的分类须都在入库 classes 里
+        (入库 classes 可以多 —— 少掉的只能是随被重建源一起消失的分类)。
+        满足 = 这个地址只核对了没被重建的源(入库 sources 去掉被重建源
+        之后为空 = 本轮没有核对),计入 drift_skipped 并记例子,不中止。
       - 其余对不上:扫描器或入库有问题,停(GeoMismatchError)。
     返回 geo_stats:{"looked_up", "verified", "drift_skipped", "drift_examples",
     "changed_sources", "elapsed_s", "peak_rss_anon_mb"}。verified =
@@ -229,6 +247,12 @@ def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float,
     allowed = frozenset(s.name for s in enabled
                         if s.name not in _registry._PRIVATE)
     changed = _sources_changed_since_scan(epochs or {}, enabled)
+
+    def changed_now() -> set[str]:
+        # 核对途中也可能有源被重建:每个对不上的地址重读一次 ptr,
+        # 不拿 geo 开头那一次的读数判(查询接口读的是 load_db() 时开的
+        # 纪元,与判定时刻一致,这里只是把「哪些源变了」认全)
+        return _sources_changed_since_scan(epochs or {}, enabled)
 
     columns = ("verdict", "confidence", "classes", "sources", "source_count")
     mismatches: list[str] = []
@@ -254,23 +278,36 @@ def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float,
             "SELECT verdict, confidence, classes, sources, source_count"
             " FROM units WHERE ip = ?", (ip,)).fetchone()
         computed = (verdict, confidence, classes, sources, source_count)
-        differing = [name for name, old, new in zip(columns, stored, computed)
-                     if old != new]
-        if differing:
+        parts = [f"{name} 入库={_short(old)} 查询接口={_short(new)}"
+                 for name, old, new in zip(columns, stored, computed)
+                 if old != new]
+        if parts:
+            changed = changed_now()
             stored_sources = _names(stored[3])
-            if (stored_sources | _names(sources)) & changed:
-                # 这个地址的证据里有扫描之后被重建过的源:只核对没重建的
-                # 那部分(两边都去掉被重建的源再比)
-                kept = lookup(ip, allowed_sources=allowed - changed,
-                              asof=asof).to_dict()
-                _, _, kept_classes, kept_sources, _, _, _ = \
-                    scan_units.extract_fields(kept)
-                if (_names(kept_sources) == stored_sources - changed
-                        and _names(kept_classes) <= _names(stored[2])):
+            rebuilt = (stored_sources | _names(sources)) & changed
+            if rebuilt:
+                # 证据里有被重建过的源:只核对没被重建的那部分(按观测比)
+                kept = _registry.collect(ip,
+                                         allowed_sources=allowed - changed)
+                accusers = {o.source for o in kept.observations
+                            if o.verdict == "malicious"}
+                witnesses = {o.source for o in kept.observations
+                             if o.verdict != "malicious"}
+                kept_types = {o.classification_type
+                              for o in kept.observations
+                              if o.verdict == "malicious"}
+                if (accusers <= stored_sources - changed
+                        and stored_sources - changed <= accusers | witnesses
+                        and kept_types <= _names(stored[2])):
                     drift_skipped += 1
-                    drift_examples.append(f"{ip}: {', '.join(differing)}")
+                    note = ("入库证据全部来自被重建的源,本轮没有核对"
+                            if not stored_sources - changed
+                            else "只核对了没被重建的源")
+                    drift_examples.append(
+                        f"{ip}: {'; '.join(parts)}"
+                        f"(涉及被重建的源: {', '.join(sorted(rebuilt))};{note})")
                     continue
-            mismatches.append(f"{ip}: {', '.join(differing)}")
+            mismatches.append(f"{ip}: {'; '.join(parts)}")
             if len(mismatches) >= _MISMATCH_EXAMPLES:
                 break
     db.commit()
@@ -281,6 +318,8 @@ def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float,
             f"{looked_up} 个,列出前 {len(mismatches)} 例)—— "
             + "; ".join(mismatches),
             looked_up=looked_up, examples=mismatches,
+            verified=looked_up - drift_skipped - len(mismatches),
+            peak_rss_anon_mb=peak_anon,
             changed_sources=sorted(changed), drift_skipped=drift_skipped,
             drift_examples=drift_examples[:_MISMATCH_EXAMPLES])
     return {"looked_up": looked_up,
@@ -353,7 +392,7 @@ def main(argv: list[str] | None = None) -> int:
         _log(f"[geo] looked_up={geo_stats['looked_up']}"
              f" verified={geo_stats['verified']}"
              f" drift_skipped={geo_stats['drift_skipped']}"
-             f" changed_sources={','.join(geo_stats['changed_sources'])}"
+             f" changed_sources={','.join(geo_stats['changed_sources']) or '-'}"
              f" peak_rss_anon_mb={geo_stats['peak_rss_anon_mb']:.1f}"
              f" elapsed_s={geo_stats['elapsed_s']:.1f}")
 
@@ -413,7 +452,9 @@ def main(argv: list[str] | None = None) -> int:
             # 核对失败时 geo_stats 还没返回:把停下之前的进度带出来
             ctx["geo_stats"] = {
                 "looked_up": exc.looked_up,
+                "verified": exc.verified,
                 "mismatch_examples": exc.examples,
+                "peak_rss_anon_mb": exc.peak_rss_anon_mb,
                 "drift_skipped": exc.drift_skipped,
                 "drift_examples": exc.drift_examples,
                 "changed_sources": exc.changed_sources}
