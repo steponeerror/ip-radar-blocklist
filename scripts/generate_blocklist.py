@@ -71,6 +71,16 @@ _MISMATCH_EXAMPLES = 10
 
 
 class GeoMismatchError(RuntimeError):
+    """geo 阶段判定核对失败。looked_up = 停下之前查过的 IP 数,
+    examples = 不一致的例子(最多 _MISMATCH_EXAMPLES 条);失败清单带上
+    这两个值(#444 评审 P3-7)。"""
+
+    def __init__(self, message: str, *, looked_up: int,
+                 examples: list[str]):
+        super().__init__(message)
+        self.looked_up = looked_up
+        self.examples = examples
+
     """geo 阶段五列核对失败:扫描入库判定与查询接口不一致。"""
 
 
@@ -142,7 +152,8 @@ def _ip_sort_key(ip: str) -> tuple:
     return (addr.version, int(addr))
 
 
-def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float) -> dict:
+def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float,
+                         max_rss_mb: int = 140) -> dict:
     """geo 阶段(#444):给进榜单 IP 补 asn/country,并核判定五列一致。
 
     进榜集合 = 档位会切的全部单 IP:嵌套档位取最大档位条数,排序键与
@@ -155,12 +166,15 @@ def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float) -> dict:
     confidence、classes、sources、source_count)用同一份 extract_fields
     从 lookup 结果算出,与扫描入库值逐列比 —— 任何一个 IP 任何一列不同
     都停:GeoMismatchError(前 10 个例子),调方走 error manifest 路径。
-    返回 geo_stats:{"looked_up", "elapsed_s"}。
+    这一段自己也量匿名内存(load_db() 之后、补查途中每 500 个采一次),
+    超过 max_rss_mb 同样停:容器的内存上限盖整轮,扫描阶段的读数代表不了
+    这一段(#444 评审 P2-3)。
+    返回 geo_stats:{"looked_up", "elapsed_s", "peak_rss_anon_mb"}。
     """
     started = time.monotonic()
     limit = max(emit_tiers.TIERS)
     candidates = [row[0] for row in db.execute(
-        f"SELECT ip FROM units WHERE verdict = 'malicious' AND is_cidr = 0 "
+        f"SELECT ip FROM units WHERE {emit_tiers.TIER_WHERE} "
         f"ORDER BY {emit_tiers.TIER_ORDER_BY} LIMIT ?", (limit,))]
     candidates.sort(key=_ip_sort_key)     # 补查按 IP 数值序(随机读局部性)
 
@@ -172,7 +186,16 @@ def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float) -> dict:
 
     columns = ("verdict", "confidence", "classes", "sources", "source_count")
     mismatches: list[str] = []
+    peak_anon = scan_units._current_anon_rss_mb()
+    looked_up = 0
     for ip in candidates:
+        if looked_up % 500 == 0 and looked_up:
+            peak_anon = max(peak_anon, scan_units._current_anon_rss_mb())
+            if peak_anon > max_rss_mb:
+                raise scan_units.MemoryBudgetExceeded(
+                    f"geo 阶段匿名内存 {peak_anon:.1f}MB 超过预算 "
+                    f"{max_rss_mb}MB(load_db 之后的引擎常驻数据)")
+        looked_up += 1
         result = lookup(ip, allowed_sources=allowed,
                         asof=asof).to_dict()
         verdict, confidence, classes, sources, source_count, asn, country = \
@@ -190,12 +213,16 @@ def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float) -> dict:
             if len(mismatches) >= _MISMATCH_EXAMPLES:
                 break
     db.commit()
+    peak_anon = max(peak_anon, scan_units._current_anon_rss_mb())
     if mismatches:
         raise GeoMismatchError(
-            "geo 阶段判定核对失败:扫描入库值与查询接口不一致"
-            f"({len(mismatches)} 例)—— " + "; ".join(mismatches))
-    return {"looked_up": len(candidates),
-            "elapsed_s": time.monotonic() - started}
+            "geo 阶段判定核对失败:扫描入库值与查询接口不一致(停下前查了"
+            f"{looked_up} 个,列出前 {len(mismatches)} 例)—— "
+            + "; ".join(mismatches),
+            looked_up=looked_up, examples=mismatches)
+    return {"looked_up": looked_up,
+            "elapsed_s": time.monotonic() - started,
+            "peak_rss_anon_mb": peak_anon}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -231,6 +258,13 @@ def main(argv: list[str] | None = None) -> int:
         scan_units.import_engine(args.data_dir, Path(args.engine_path))
         scan_stats = scan_units.scan_units(
             args.data_dir, db, asof=asof, log=_log)
+        if scan_stats["units_total"] == 0:
+            # 零单元 = 手上没有证据,不发空档位:空档位会被宿主的 push.sh
+            # 发成 Release,下游读成「今天没有恶意 IP」。常见原因是数据卷
+            # 没挂对,或引擎数据目录是空的(#444 评审 P2-1)。
+            raise scan_units.ScanUnitsError(
+                "扫描出 0 个单元,不发空档位——先查数据卷有没有挂对、"
+                "引擎数据目录是不是空的(生产约 553 万个单元)")
         stage_s["scan"] = round(time.monotonic() - stage_started, 3)
         stage_started = time.monotonic()
         _log(f"[scan] units_total={scan_stats['units_total']}"
@@ -244,10 +278,12 @@ def main(argv: list[str] | None = None) -> int:
              f" elapsed_s={scan_stats['elapsed_s']:.1f}")
 
         stage = "geo"
-        geo_stats = _geo_fill_and_verify(db, asof=asof)
+        geo_stats = _geo_fill_and_verify(db, asof=asof,
+                                         max_rss_mb=args.max_rss_mb)
         stage_s["geo"] = round(time.monotonic() - stage_started, 3)
         stage_started = time.monotonic()
         _log(f"[geo] looked_up={geo_stats['looked_up']}"
+             f" peak_rss_anon_mb={geo_stats['peak_rss_anon_mb']:.1f}"
              f" elapsed_s={geo_stats['elapsed_s']:.1f}")
 
         stage = "emit"
@@ -272,11 +308,13 @@ def main(argv: list[str] | None = None) -> int:
             "stage_elapsed_s": stage_s,
             "elapsed_s": round(time.monotonic() - started, 3),
             # 双口径峰值(T7):peak_rss_mb = ru_maxrss 总量(含可回收 mmap
-            # 文件页,仅观测);peak_rss_anon_mb = scan 逐批匿名采样峰值
-            # (--max-rss-mb 红线口径;当前采样非内核峰值,间隔尖峰归 cgroup)。
+            # 文件页,仅观测);peak_rss_anon_mb = scan 逐批采样与 geo 采样
+            # 两段的匿名内存最大值(--max-rss-mb 红线口径;当前采样非内核
+            # 峰值,间隔尖峰归 cgroup)。
             "peak_rss_mb": round(scan_units._current_rss_mb(), 1),
-            "peak_rss_anon_mb": round(
-                scan_stats.get("peak_rss_anon_mb", 0.0), 1),
+            "peak_rss_anon_mb": round(max(
+                scan_stats.get("peak_rss_anon_mb", 0.0),
+                geo_stats.get("peak_rss_anon_mb", 0.0)), 1),
         })
         tmp = out_dir / "manifest.json.tmp"
         tmp.write_text(
@@ -300,6 +338,10 @@ def main(argv: list[str] | None = None) -> int:
             ctx["scan_stats"] = scan_stats
         if geo_stats is not None:
             ctx["geo_stats"] = geo_stats
+        elif isinstance(exc, GeoMismatchError):
+            # 核对失败时 geo_stats 还没返回:把停下之前的进度带出来
+            ctx["geo_stats"] = {"looked_up": exc.looked_up,
+                                "mismatch_examples": exc.examples}
         try:
             emit_tiers.write_error_manifest(out_dir, error, **ctx)
             payload = json.loads(

@@ -104,7 +104,7 @@ def test_cli_end_to_end_publishes_tiers_and_manifest(engine_env, tmp_path):
                                  for n in DEFAULT_TIERS}
 
     # scan_stats:单元数(v4/v6/单地址/网段)、扫描器自报分解、恶意数、
-    # 读了几条记录、时刻锚
+    # 读了几条记录、判定时刻
     scan_stats = manifest["scan_stats"]
     assert scan_stats["units_total"] == UNIVERSE_TOTAL
     assert scan_stats["units_v4"] == 5
@@ -128,6 +128,11 @@ def test_cli_end_to_end_publishes_tiers_and_manifest(engine_env, tmp_path):
 
     # geo_stats:进榜单 IP 全量补查
     assert manifest["geo_stats"]["looked_up"] == SINGLE_MALICIOUS_POOL
+    # geo 阶段自己也量匿名内存(load_db 之后和补查途中各采;#444 评审
+    # P2-3):容器的 150MB 上限原先在这一段没有读数
+    assert manifest["geo_stats"]["peak_rss_anon_mb"] > 0
+    assert manifest["peak_rss_anon_mb"] >= \
+        manifest["geo_stats"]["peak_rss_anon_mb"]
     for key in ("scan", "geo", "emit"):
         assert manifest["stage_elapsed_s"][key] > 0
     assert manifest["elapsed_s"] > 0
@@ -177,7 +182,7 @@ def test_cli_local_anchor_data_dir_flag_drives_registry(engine_env, tmp_path):
 
 # ── 用例 2:对拍(扫描入库值 vs 同进程 lookup)──
 
-def test_scan_rows_match_inprocess_lookup(engine_env):
+def test_scan_rows_match_inprocess_lookup(engine_env, monkeypatch):
     """夹具数据目录上,units 表每一行的五列与同进程
     lookup(网络地址, asof=同一时刻).to_dict() 经 extract_fields 算出的
     一样;行数等于扫描器的单元数。"""
@@ -187,7 +192,7 @@ def test_scan_rows_match_inprocess_lookup(engine_env):
 
     # 扫描句柄已关,同进程才能 load_db(py-lmdb 同路径禁双开);
     # IP_RADAR_POOL_CHILD=1 防 load_db 清旧纪元目录
-    os.environ["IP_RADAR_POOL_CHILD"] = "1"
+    monkeypatch.setenv("IP_RADAR_POOL_CHILD", "1")
     from ipdb import load_db, lookup, _registry
     load_db()
     allowed = frozenset(s.name for s in _registry._enabled_sources()
@@ -263,6 +268,9 @@ def test_geo_mismatch_writes_error_manifest_nothing_published(
     assert "confidence" in payload["error"]
     assert "1.2.3.5" in payload["error"]
     assert payload["stage"] == "geo"
+    # 失败清单里带上补查进度(#444 评审 P3-7):查了几个、哪些例子不一致
+    assert payload["geo_stats"]["looked_up"] >= 1
+    assert "1.2.3.5" in " ".join(payload["geo_stats"]["mismatch_examples"])
     assert payload["scan_stats"]["units_total"] == UNIVERSE_TOTAL
     assert capsys.readouterr().out == ""   # 失败不往 stdout 打成功 manifest
 
@@ -290,4 +298,28 @@ def test_cli_engine_without_scan_module_fails_loud(engine_env, tmp_path):
     assert "引擎镜像早于 #444" in payload["error"]
     assert payload["stage"] == "scan"
     assert "error" in proc.stderr
+    assert proc.stdout == ""
+
+
+# ── 用例 5:扫出 0 个单元不发布空档位(#444 评审 P2-1)──
+
+def test_cli_zero_units_refuses_to_publish(tmp_path):
+    """数据目录是空的(卷没挂对时就是这个样子)→ 扫描出 0 个单元 →
+    退出 1、写 error manifest、不发布任何档位文件。空档位会被宿主的
+    push.sh 发成 Release,下游读成「今天没有恶意 IP」,所以必须停。
+    拆掉 generate_blocklist.py 里「units_total == 0」那段守卫即红。"""
+    empty = tmp_path / "empty-data"
+    empty.mkdir()
+    out_dir = tmp_path / "out"
+
+    proc = _run_cli("--data-dir", empty, "--out-dir", out_dir,
+                    "--asof", str(int(ASOF)))
+
+    assert proc.returncode == 1
+    assert [p.name for p in out_dir.iterdir()] == ["manifest.json"]
+    payload = json.loads(
+        (out_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert "0 个单元" in payload["error"]
+    assert payload["stage"] == "scan"
+    assert payload["scan_stats"]["units_total"] == 0     # 空目录 = 0 单元
     assert proc.stdout == ""

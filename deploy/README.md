@@ -39,9 +39,8 @@ cd /opt && git clone https://github.com/steponeerror/ip-radar-blocklist.git ip-r
 cd /opt/ip-radar-blocklist
 docker compose -f deploy/docker-compose.exporter.yml --profile export config -q
 
-# 3. 核对引擎 docker 网络名(默认假定 ip-lookup-tool_default)
-docker network ls | grep ip-lookup-tool
-#   若不同:导出 IPRADAR_NETWORK=<实际网络名>(可写进 unit 的 Environment=)
+# 3. 核对引擎镜像含按键序扫描器(#444 A 步);没有就先部署引擎、重建镜像
+docker run --rm --entrypoint python ipradar:latest -c "import ipdb._scan; print('ok')"
 
 # 4. 核对引擎数据卷存在且非空(默认假定 ip-lookup-tool_ipradar-data)
 docker volume inspect ip-lookup-tool_ipradar-data --format '{{.Mountpoint}}'
@@ -84,11 +83,10 @@ systemctl list-timers ipradar-blocklist.timer   # 核对下次触发点
 | 变量 | 默认 | 用途 |
 |---|---|---|
 | `IPRADAR_DATA_VOLUME` | `ip-lookup-tool_ipradar-data` | 引擎栈的 LMDB 数据**命名卷**全名(`<引擎项目名>_ipradar-data`);导出器以只读方式挂到与引擎容器相同的 `/app/data`,不猜宿主路径 |
-| `IPRADAR_NETWORK` | `ip-lookup-tool_default` | 引擎 compose 项目网络 |
 
 引擎代码与数据路径:导出器复用镜像 `ipradar:latest`,引擎 backend 直接用镜像
 内烤入的 `/app/backend`(引擎 compose 从仓根 context 构建,baked 即权威版本,
-已实机验证 import 走通),不再从宿主 bind 覆盖 —— 与数据卷同理,消除路径猜测。
+不再从宿主 bind 覆盖 —— 与数据卷同理,消除路径猜测。
 
 另:推送 token 可用 env `BLOCKLIST_PUSH_TOKEN` 临时覆盖 token 文件。
 
@@ -96,14 +94,16 @@ systemctl list-timers ipradar-blocklist.timer   # 核对下次触发点
 
 成功轮:`generated_at` / `tiers`(每档实际行数)/ `malicious_pool` /
 `peak_rss_mb`(ru_maxrss 总量,仅观测)/ `peak_rss_anon_mb`(红线口径,
-scan 阶段逐批匿名采样峰值)/ `elapsed_s` / `stage_elapsed_s`(各阶段耗时)/
-`asof`(判定时刻锚)/ `epochs`(各库纪元号,变了就重跑)/
-`scan_stats`(单元数、恶意数、读了几条记录)/ `geo_stats`(补查了几个)。
+scan 阶段逐批采样与 geo 阶段采样两段的匿名内存最大值)/ `elapsed_s` / `stage_elapsed_s`(各阶段耗时)/
+`asof`(判定时刻,两个阶段共用)/ `epochs`(各库纪元号,变了就重跑)/
+`scan_stats`(单元数、恶意数、读了几条记录)/ `geo_stats`(补查了几个、这一段的匿名内存峰值)。
 **失败轮:`error` 键出现即本轮失败**(带 `[阶段]` 前缀),此时 systemd 单元
 为 failed、**未推送**;档位文件保持上一成功轮原样。处理:
 `journalctl -u ipradar-blocklist.service` 看容器 stderr 进度行定位阶段,
 修复后 `systemctl start ipradar-blocklist.service` 重跑。常见失败:
-引擎数据卷缺失/为空(scan 阶段单元数为 0 或挂载报错)、引擎镜像太旧
+引擎数据卷缺失/为空(scan 阶段报「扫描出 0 个单元,不发空档位」——
+空档位会被发成 Release,所以零单元直接停;看 `scan_stats.units_total`,
+生产约 553 万,为 0 就是卷没挂对,修好卷再重跑)、引擎镜像太旧
 (scan 阶段报「引擎镜像早于 #444」—— 先重建引擎镜像再跑)、geo 阶段
 判定对不上(「geo 阶段判定核对失败」带例子的 IP 和列 —— 引擎扫描器与
 查询接口行为不一致,按报错找引擎侧)、RSS 超限(看 `error` 里的阶段)、

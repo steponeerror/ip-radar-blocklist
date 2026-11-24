@@ -9,7 +9,7 @@
 短路判 reserved,判不出 malicious;A 步引擎测试(tests/lookup/
 test_scan_units.py)同款取址。
 
-相位纪律(py-lmdb 同进程同路径禁双开,A 步引擎测试同款):
+顺序约束(py-lmdb 同进程同路径禁双开,A 步引擎测试同款):
     建库(rebuild 后句柄已关)→ 扫描(scan_units,扫描器自开自关)
     → load_db() → lookup()。
 每个测试用自己的 tmp 数据目录,测试间路径不重叠;同一测试内先扫描后
@@ -26,7 +26,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))      # scripts/ as namespace pkg portion
 
 ENGINE_BACKEND = Path("/home/huxiao/dev/pi-ip-lookup-tool/backend")
-ASOF = 1765000000.0                        # 与本机整轮试跑同一时刻锚
+ASOF = 1765000000.0                        # 与本机整轮试跑同一判定时刻
 
 # 全 12 列建表(CLI 先建 5 列再 ALTER 7 列共识列之后的形态;列序同
 # scripts/generate_blocklist.py 的 UNITS_DDL + CONSENSUS_COLUMNS)
@@ -105,7 +105,7 @@ def build_engine_shards(data_dir: Path) -> list:
 
     insts = [dataplane, turris, tor]
     # rebuild 会把写库 env 挂在实例的 _reader/_reader6 上;引用计数即关
-    # (py-lmdb 同进程同路径禁双开:扫描器还要开同一纪元目录,相位纪律
+    # (py-lmdb 同进程同路径禁双开:扫描器还要开同一纪元目录,顺序约束
     # 同 A 步引擎测试)
     for inst in insts:
         inst._reader = None

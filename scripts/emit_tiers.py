@@ -44,6 +44,10 @@ TIERS = (100, 500, 1000, 5000, 10000)
 TIER_ORDER_BY = ("source_count DESC, confidence DESC,"
                  " last_seen IS NULL ASC, last_seen DESC, ip ASC")
 
+# 档位筛选谓词:档位 SQL 与 geo 阶段选进榜集合(#444)共用这一份,不抄
+# 两份——将来改筛选(比如 v6 单独一档)两处一起变。
+TIER_WHERE = "verdict = 'malicious' AND is_cidr = 0"
+
 # 档位 SQL:is_cidr = 0(2026-10-25 口径)— 档位一行一个单 IP — 上游
 # 原生 CIDR 单元(spamhaus DROP/firehol 聚合段)不展开、不进档;池内
 # CIDR 计数仍由 manifest.cidr_units 观测,不静默。全档位共用,仅 LIMIT
@@ -51,7 +55,7 @@ TIER_ORDER_BY = ("source_count DESC, confidence DESC,"
 _TIER_SQL = f"""
 SELECT {", ".join(CSV_HEADER)}
 FROM units
-WHERE verdict = 'malicious' AND is_cidr = 0
+WHERE {TIER_WHERE}
 ORDER BY {TIER_ORDER_BY}
 LIMIT ?
 """

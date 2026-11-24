@@ -61,18 +61,8 @@ services:
       # /app/backend(引擎 compose 从仓根 context 构建,baked 内容即权威
       # 版本,且已实机验证引擎 import 走通);不猜宿主 backend 路径,
       # 与数据卷同理消除路径猜测失败面。
-    networks:
-      - ipradar
-
-networks:
-  ipradar:
-    # 引擎栈(ip-lookup-tool compose 项目)的 docker 网络;项目改名时用
-    # 环境变量 IPRADAR_NETWORK 覆盖。
-    name: ${IPRADAR_NETWORK:-ip-lookup-tool_default}
-    external: true
-    # 无需 extra_hosts:引擎容器以 compose 服务别名 `ipradar` 附着在本网络
-    # (已核对引擎仓 docker-compose.yml 服务键),Docker 内置 DNS 直接解析
-    # http://ipradar:8000 —— 写死 IP 反而脆弱。
+    # 不接任何 docker 网络(#444 起):导出在容器进程里直接调引擎代码读
+    # 数据卷,不再走 http://ipradar:8000,用不着引擎栈的网络。
 
 volumes:
   blocklist-engine-data:

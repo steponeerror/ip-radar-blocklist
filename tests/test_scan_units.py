@@ -200,3 +200,23 @@ def test_require_scan_engine_error_message(monkeypatch):
     monkeypatch.setitem(sys.modules, "ipdb._scan", None)
     with pytest.raises(su.ScanUnitsError, match="引擎镜像早于 #444"):
         su.require_scan_engine()
+
+
+def test_scan_units_anon_rss_falls_back_to_ru_maxrss(
+        engine_env, monkeypatch, capsys):
+    """整轮都读不到 smaps_rollup 的匿名行(路径不存在)→ 只告警一次,
+    匿名内存读数回退成 ru_maxrss 总量,并进入本轮峰值(旧口径;
+    #444 评审 P3-4,搬自旧 consensus_client 的整轮回退用例)。"""
+    monkeypatch.setattr(su, "_SMAPS_ROLLUP_PATH", "/nonexistent/smaps_rollup")
+    monkeypatch.setattr(su, "_anon_rss_fallback_warned", False)
+    db = sqlite3.connect(":memory:")
+    create_units(db)
+
+    stats = su.scan_units(engine_env["data_dir"], db, asof=ASOF)
+
+    err = capsys.readouterr().err
+    assert err.count("cannot parse Anonymous") == 1
+    # ru_maxrss 是进程至今的峰值,跑的过程中只增不减:回退值取到的
+    # 峰值不会超过收尾时再读一次的值,也不会比它小太多(同一进程)
+    assert 0 < stats["peak_rss_anon_mb"] <= su._current_rss_mb() + 0.01
+    assert stats["peak_rss_anon_mb"] >= su._current_rss_mb() * 0.5

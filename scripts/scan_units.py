@@ -13,7 +13,7 @@ IP 补查回写(见 generate_blocklist.py)。
 RSS(smaps_rollup `Anonymous:` 行,解析失败回退 ru_maxrss 并告警一次),
 超过 max_rss_mb 抛 MemoryBudgetExceeded —— 爆顶死任务不死机器。
 
-引擎导入合同:IP_RADAR_DATA_DIR 在 registry import 期消费,必须先于
+引擎导入约定:IP_RADAR_DATA_DIR 在 registry import 期消费,必须先于
 第一个 import ipdb 设置 —— import_engine 从 data_dir 参数惰性完成
 (setdefault:已导入的进程(测试)沿用模块缓存);engine_path 进 sys.path
 同在 import_engine。require_scan_engine 探测引擎镜像里有没有 _scan 模块:
@@ -151,8 +151,8 @@ def extract_fields(row: dict) -> tuple:
     threat = row.get("threat") or {}
     verdict = threat.get("verdict")
     if not verdict:
-        # 无 verdict 行若落库 NULL 会永远留在待补集合里 → 分页死循环。
-        # 协议破损,响亮失败。
+        # 引擎输出破损,响亮失败:落库 NULL 会让下游档位 SQL 的 verdict
+        # 过滤失真(旧逐 IP 查询路径在这里的理由是「分页死循环」)。
         raise ScanUnitsError(
             f"row {row.get('ip')!r}: missing threat.verdict")
     if verdict != "malicious":
@@ -189,7 +189,7 @@ def scan_units(data_dir, db: sqlite3.Connection, *, asof,
     个单元 executemany + commit,提交后量一次匿名内存,超 max_rss_mb 抛
     MemoryBudgetExceeded(已提交的批次保留,其余单元不再写)。
 
-    引擎导入合同见模块 docstring:调方先 import_engine 设 env/sys.path;
+    引擎导入约定见模块 docstring:调方先 import_engine 设 env/sys.path;
     本函数 setdefault 兜底 env,并经 require_scan_engine 探测 _scan 模块。
     返回 stats:单元数(units_total/v4/v6/single/cidr 与扫描器自报的
     scanner_units)、malicious 数、records_total(读了几条记录)、
