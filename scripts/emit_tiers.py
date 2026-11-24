@@ -33,19 +33,26 @@ from pathlib import Path
 CSV_HEADER = ("ip", "asn", "country", "classes", "confidence",
               "source_count", "first_seen", "last_seen")
 
-# 单条排序 SQL(Q2-B):source_count DESC → confidence DESC →
+# 档位大小(嵌套超集)。geo 阶段(#444)选进榜集合取最大档位条数,
+# 共用这份常量 —— 两处条数漂移 = 补查集合和档位集合不一致。
+TIERS = (100, 500, 1000, 5000, 10000)
+
+# 单条排序键链(Q2-B):source_count DESC → confidence DESC →
 # last_seen NULLS LAST(SQLite 无 NULLS LAST 关键字,`last_seen IS NULL`
 # 得 0/1,ASC 即非 NULL 在前)→ last_seen DESC 最新优先 → ip ASC 终键保
-# 跨轮确定性。全档位共用,仅 LIMIT 不同 → 嵌套超集恒成立。
-# is_cidr = 0(2026-10-25 口径):档位一行一个单 IP — 上游原生 CIDR
-# 单元(spamhaus DROP/firehol 聚合段)不展开、不进档;池内 CIDR
-# 计数仍由 manifest.cidr_units 观测,不静默。
+# 跨轮确定性。档位 SQL 与 geo 补查选集(#444)共用这一份常量,不抄两份。
+TIER_ORDER_BY = ("source_count DESC, confidence DESC,"
+                 " last_seen IS NULL ASC, last_seen DESC, ip ASC")
+
+# 档位 SQL:is_cidr = 0(2026-10-25 口径)— 档位一行一个单 IP — 上游
+# 原生 CIDR 单元(spamhaus DROP/firehol 聚合段)不展开、不进档;池内
+# CIDR 计数仍由 manifest.cidr_units 观测,不静默。全档位共用,仅 LIMIT
+# 不同 → 嵌套超集恒成立。
 _TIER_SQL = f"""
 SELECT {", ".join(CSV_HEADER)}
 FROM units
 WHERE verdict = 'malicious' AND is_cidr = 0
-ORDER BY source_count DESC, confidence DESC,
-         last_seen IS NULL ASC, last_seen DESC, ip ASC
+ORDER BY {TIER_ORDER_BY}
 LIMIT ?
 """
 
@@ -105,7 +112,7 @@ def _verify_staged(staging: Path, tiers: tuple, pool: int) -> None:
 
 
 def emit_tiers(db: sqlite3.Connection, out_dir: Path, *,
-               tiers: tuple = (100, 500, 1000, 5000, 10000),
+               tiers: tuple = TIERS,
                staging_dir: Path | None = None) -> dict:
     """Rank the malicious pool, slice nested tiers, atomically publish.
 
