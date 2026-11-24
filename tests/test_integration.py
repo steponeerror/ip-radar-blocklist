@@ -24,7 +24,8 @@ from scripts import scan_units as su                  # noqa: E402
 from scripts import generate_blocklist as gb          # noqa: E402
 
 from conftest import (ASOF, ENGINE_BACKEND, MALICIOUS_TOTAL,  # noqa: E402
-                      SINGLE_MALICIOUS_POOL, UNIVERSE_TOTAL, create_units)
+                      SINGLE_MALICIOUS_POOL, TURRIS_ROWS, UNIVERSE_TOTAL,
+                      create_units)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CLI = REPO_ROOT / "scripts" / "generate_blocklist.py"
@@ -117,6 +118,13 @@ def test_cli_end_to_end_publishes_tiers_and_manifest(engine_env, tmp_path):
     assert scan_stats["records_total"] == 10
     assert scan_stats["skipped_anomalies"] == 0
     assert scan_stats["asof"] == ASOF
+    # geo 核对里与「扫描之后有源被重建」有关的三项(#444 生产试跑
+    # 2026-11-25):
+    # 本夹具扫描之后没有源重建 → 没有被跳过的地址
+    assert manifest["geo_stats"]["changed_sources"] == []
+    assert manifest["geo_stats"]["drift_skipped"] == 0
+    assert manifest["geo_stats"]["verified"] == \
+        manifest["geo_stats"]["looked_up"] == SINGLE_MALICIOUS_POOL
 
     # 各库纪元号进清单(扫描器逐源报 [v4, v6];无分片的源是
     # [None, None],照实透传 —— 夹具在子进程里经真 registry 发现,只有
@@ -131,8 +139,10 @@ def test_cli_end_to_end_publishes_tiers_and_manifest(engine_env, tmp_path):
     # geo 阶段自己也量匿名内存(load_db 之后和补查途中各采;#444 评审
     # P2-3):容器的 150MB 上限原先在这一段没有读数
     assert manifest["geo_stats"]["peak_rss_anon_mb"] > 0
-    assert manifest["peak_rss_anon_mb"] >= \
-        manifest["geo_stats"]["peak_rss_anon_mb"]
+    # 清单里的峰值 = 两段匿名内存峰值取大后四舍五入到 0.1(18.113 → 18.1)
+    assert manifest["peak_rss_anon_mb"] == round(max(
+        scan_stats["peak_rss_anon_mb"],
+        manifest["geo_stats"]["peak_rss_anon_mb"]), 1)
     for key in ("scan", "geo", "emit"):
         assert manifest["stage_elapsed_s"][key] > 0
     assert manifest["elapsed_s"] > 0
@@ -233,6 +243,248 @@ def test_geo_verdict_mismatch_aborts(engine_env):
         gb._geo_fill_and_verify(db, asof=ASOF)
 
 
+# ── 用例 3 延伸:扫描之后有源被重建(生产试跑 2026-11-25 的失败形)──
+#
+# 生产上扫描要跑一个多小时,期间引擎照常重建源(新纪元目录 + 换 ptr)。
+# 扫描读的是开跑时钉住的旧纪元;geo 核对调的 lookup() 读的是现在的纪元。
+# 重建恰好改了某个进榜地址的证据时,两边五列必不一致 —— 这不是扫描器
+# 的错。规则:证据里含「扫描之后被重建过的源」的地址,只核对没重建的
+# 那部分源(把重建过的源从两边都去掉再比);其余地址照常逐列核对。
+
+TURRIS_EXTRA_ROW = "1.2.3.7,smtp"       # 让 1.2.3.7 多出一个源(turris)
+
+
+def _scan_then_rebuild_turris(engine_env):
+    """扫描入库 → 重建 turris(多一行)→ 返回 (db, 扫描时钉住的 epochs)。
+    1.2.3.7 扫描时只有 dataplane;重建后查询接口看到 dataplane + turris。"""
+    db = sqlite3.connect(":memory:")
+    create_units(db)
+    stats = su.scan_units(engine_env["data_dir"], db, asof=ASOF)
+    data_dir = engine_env["data_dir"]
+    (data_dir / "turris_greylist.csv").write_text(
+        "Address,Tags\n" + "\n".join(TURRIS_ROWS + [TURRIS_EXTRA_ROW])
+        + "\n", encoding="utf-8")
+    turris = engine_env["insts"][1]
+    turris.rebuild()
+    turris._reader = None
+    turris._reader6 = None
+    return db, stats["epochs"]
+
+
+def test_geo_source_rebuilt_after_scan_is_skipped_not_fatal(engine_env):
+    """扫描之后 turris 被重建、多给了 1.2.3.7 一条记录 → 那个地址五列
+    对不上,但只差在重建过的源上:不中止;清单报出重建过的源、跳过的
+    地址数和例子;进榜地址全部补查过。"""
+    db, epochs = _scan_then_rebuild_turris(engine_env)
+    before = db.execute("SELECT sources FROM units WHERE ip = '1.2.3.7'"
+                        ).fetchone()[0]
+    assert before == "dataplane"                   # 扫描入库值是旧纪元的
+
+    geo = gb._geo_fill_and_verify(db, asof=ASOF, epochs=epochs)
+
+    assert geo["changed_sources"] == ["turris_greylist"]
+    assert geo["drift_skipped"] == 1
+    assert geo["verified"] == geo["looked_up"] - 1 == SINGLE_MALICIOUS_POOL - 1
+    assert any(ex.startswith("1.2.3.7:") and "sources" in ex
+               and "turris_greylist" in ex
+               for ex in geo["drift_examples"])
+    # 入库值不因跳过而改写(档位仍按扫描时的快照出)
+    assert db.execute("SELECT sources FROM units WHERE ip = '1.2.3.7'"
+                      ).fetchone()[0] == "dataplane"
+
+
+def test_geo_skips_only_mismatches_that_involve_a_rebuilt_source(engine_env):
+    """对不上的地址,证据里没有重建过的源 → 照旧中止(别的源被重建不是
+    放行理由)。这里不真重建,只在传给核对的纪元表里说 danmeuk_tor 被
+    重建过(它不在 1.2.3.7 的证据里)。"""
+    db = sqlite3.connect(":memory:")
+    create_units(db)
+    stats = su.scan_units(engine_env["data_dir"], db, asof=ASOF)
+    db.execute("UPDATE units SET confidence = confidence + 1"
+               " WHERE ip = '1.2.3.7'")
+    lying = {**stats["epochs"], "danmeuk_tor": [999, 999]}
+
+    with pytest.raises(gb.GeoMismatchError,
+                       match=r"1\.2\.3\.7.*confidence") as excinfo:
+        gb._geo_fill_and_verify(db, asof=ASOF, epochs=lying)
+    # 失败清单的素材:认出了哪个源被重建过,但没有地址因此被跳过
+    assert excinfo.value.changed_sources == ["danmeuk_tor"]
+    assert excinfo.value.drift_skipped == 0
+
+
+def _add_tor_accuser(engine_env, monkeypatch, rows):
+    """给夹具加一个威胁类小源 tor_accuser:分类 tor、verdict malicious,
+    和资产类证人 danmeuk_tor(分类 tor、verdict suspicious)同组。
+    返回 (实例, 重建函数)。"""
+    from ipdb import _registry
+    from ipdb._sources._base import IpListSource
+
+    class _TorAccuser(IpListSource):
+        name = "tor_accuser"
+        category = "threat"
+        url = ""
+        filename = "tor_accuser.txt"
+        fields = ()
+        classification_type = "tor"
+        verdict = "malicious"
+        reliability = 0.6
+        stale_days = 1
+
+    data_dir = engine_env["data_dir"]
+    acc = _TorAccuser(data_dir)
+
+    def rebuild(new_rows):
+        (data_dir / "tor_accuser.txt").write_text(
+            "\n".join(new_rows) + "\n", encoding="utf-8")
+        acc.rebuild()
+        acc._reader = None
+        acc._reader6 = None
+
+    rebuild(rows)
+    insts = engine_env["insts"] + [acc]
+    monkeypatch.setattr(_registry, "_sources", insts)
+    _registry._enabled_cache["entry"] = None
+    _registry._loaded_cache["entry"] = None
+    return acc, rebuild
+
+
+def test_geo_skip_compares_observations_not_group_results(
+        engine_env, monkeypatch):
+    """同组证人(评审 P2-1):1.2.3.5 的 tor 组里,tor_accuser 是唯一的
+    指控者,danmeuk_tor 是 suspicious 证人 —— 入库 sources 两个都在。
+    扫描之后 tor_accuser 被重建、不再列 1.2.3.5(减法形):现在 tor 组只剩
+    证人,不再算恶意组,danmeuk_tor 也就不在查询接口的 sources 里。
+    按「去掉被重建的源之后五列相等」比,这里会误判成对不上;按观测比
+    (证人算证人)才对。同时钉住:入库 classes 多出的 tor 不要求相等。"""
+    acc, rebuild = _add_tor_accuser(engine_env, monkeypatch, ["1.2.3.5"])
+    db = sqlite3.connect(":memory:")
+    create_units(db)
+    stats = su.scan_units(engine_env["data_dir"], db, asof=ASOF)
+    stored = db.execute(
+        "SELECT classes, sources FROM units WHERE ip = '1.2.3.5'").fetchone()
+    assert set(stored[1].split(";")) == {
+        "dataplane", "turris_greylist", "danmeuk_tor", "tor_accuser"}
+    assert "tor" in stored[0].split(";")
+
+    rebuild(["1.2.3.8"])                   # 1.2.3.5 不再被 tor_accuser 列出
+
+    geo = gb._geo_fill_and_verify(db, asof=ASOF, epochs=stats["epochs"])
+
+    assert geo["changed_sources"] == ["tor_accuser"]
+    assert geo["drift_skipped"] == 1
+    assert any(ex.startswith("1.2.3.5:") and "tor_accuser" in ex
+               for ex in geo["drift_examples"])
+
+
+def test_geo_address_whose_evidence_was_all_rebuilt_is_marked_unverified(
+        engine_env):
+    """地址的证据全部来自后来被重建的源(1.2.3.6 只在 turris 里,重建后
+    不再列出):去掉被重建的源后两边都没有证据,核对无从做起 —— 跳过它,
+    例子里明说「本轮没有核对」,不让它混进「核对过」的数里。"""
+    data_dir = engine_env["data_dir"]
+    (data_dir / "turris_greylist.csv").write_text(
+        "Address,Tags\n" + "\n".join(TURRIS_ROWS + ["1.2.3.6,smtp"])
+        + "\n", encoding="utf-8")
+    turris = engine_env["insts"][1]
+    turris.rebuild()
+    turris._reader = None
+    turris._reader6 = None
+    db = sqlite3.connect(":memory:")
+    create_units(db)
+    stats = su.scan_units(data_dir, db, asof=ASOF)
+    assert db.execute("SELECT sources FROM units WHERE ip = '1.2.3.6'"
+                      ).fetchone()[0] == "turris_greylist"
+
+    (data_dir / "turris_greylist.csv").write_text(
+        "Address,Tags\n" + "\n".join(TURRIS_ROWS) + "\n", encoding="utf-8")
+    turris.rebuild()
+    turris._reader = None
+    turris._reader6 = None
+
+    geo = gb._geo_fill_and_verify(db, asof=ASOF, epochs=stats["epochs"])
+
+    assert geo["changed_sources"] == ["turris_greylist"]
+    assert geo["drift_skipped"] == 1          # 只有 1.2.3.6
+    assert any(ex.startswith("1.2.3.6:") and "没有核对" in ex
+               for ex in geo["drift_examples"])
+    assert geo["verified"] == geo["looked_up"] - geo["drift_skipped"]
+
+
+def test_geo_skip_still_requires_unchanged_accusers_classes_in_stored(
+        engine_env):
+    """没被重建的源给出的分类,入库 classes 里必须有:把入库 classes 抹掉
+    (sources 留着)→ 没被重建的 dataplane 给的 brute-force 不在里面 → 中止。"""
+    db, epochs = _scan_then_rebuild_turris(engine_env)
+    db.execute("UPDATE units SET classes = '' WHERE ip = '1.2.3.7'")
+
+    with pytest.raises(gb.GeoMismatchError,
+                       match=r"1\.2\.3\.7.*classes"):
+        gb._geo_fill_and_verify(db, asof=ASOF, epochs=epochs)
+
+
+def test_geo_skip_still_requires_unchanged_accusers_in_stored_sources(
+        engine_env, monkeypatch):
+    """没被重建的指控者必须在入库 sources 里:1.2.3.5 的入库 sources 抹到
+    只剩 danmeuk_tor 和 tor_accuser(classes 不动),没被重建的 dataplane、
+    turris_greylist 两个指控者不见了 → 中止。"""
+    acc, rebuild = _add_tor_accuser(engine_env, monkeypatch, ["1.2.3.5"])
+    db = sqlite3.connect(":memory:")
+    create_units(db)
+    stats = su.scan_units(engine_env["data_dir"], db, asof=ASOF)
+    rebuild(["1.2.3.8"])
+    db.execute("UPDATE units SET sources = 'danmeuk_tor;tor_accuser'"
+               " WHERE ip = '1.2.3.5'")
+
+    with pytest.raises(gb.GeoMismatchError,
+                       match=r"1\.2\.3\.5.*sources"):
+        gb._geo_fill_and_verify(db, asof=ASOF, epochs=stats["epochs"])
+
+
+def test_geo_skip_still_requires_unchanged_witnesses_in_stored_sources(
+        engine_env, monkeypatch):
+    """没被重建的证人(扫描时进过恶意组的)必须在入库 sources 里:1.2.3.5 的
+    tor 组扫描时有指控者 tor_accuser 和证人 danmeuk_tor;tor_accuser 之后
+    被重建(还列着 1.2.3.5),入库 sources 被抹到只剩 dataplane 和 turris ——
+    证人 danmeuk_tor 不见了 → 中止。"""
+    acc, rebuild = _add_tor_accuser(engine_env, monkeypatch, ["1.2.3.5"])
+    db = sqlite3.connect(":memory:")
+    create_units(db)
+    stats = su.scan_units(engine_env["data_dir"], db, asof=ASOF)
+    rebuild(["1.2.3.5", "1.2.3.8"])
+    db.execute("UPDATE units SET sources = 'dataplane;turris_greylist',"
+               " source_count = 2 WHERE ip = '1.2.3.5'")
+
+    with pytest.raises(gb.GeoMismatchError,
+                       match=r"1\.2\.3\.5.*sources"):
+        gb._geo_fill_and_verify(db, asof=ASOF, epochs=stats["epochs"])
+
+
+def test_geo_skip_still_rejects_stored_source_the_engine_never_returned(
+        engine_env):
+    """入库 sources 里有查询接口从来没给过的源(没被重建的 danmeuk_tor
+    在 1.2.3.7 上没有记录)→ 中止:入库多出了看不到的源。"""
+    db, epochs = _scan_then_rebuild_turris(engine_env)
+    db.execute("UPDATE units SET sources = 'dataplane;danmeuk_tor',"
+               " source_count = 2 WHERE ip = '1.2.3.7'")
+
+    with pytest.raises(gb.GeoMismatchError,
+                       match=r"1\.2\.3\.7.*sources"):
+        gb._geo_fill_and_verify(db, asof=ASOF, epochs=epochs)
+
+
+def test_geo_skip_requires_the_unchanged_sources_to_agree(engine_env):
+    """证据里有重建过的源、但没重建的那部分也对不上 → 中止。
+    1.2.3.7 重建后查询接口 = dataplane + turris;把入库值改成空 →
+    没重建的 dataplane 两边就不一致了。"""
+    db, epochs = _scan_then_rebuild_turris(engine_env)
+    db.execute("UPDATE units SET sources = '', source_count = 0,"
+               " classes = '' WHERE ip = '1.2.3.7'")
+
+    with pytest.raises(gb.GeoMismatchError,
+                       match=r"1\.2\.3\.7.*sources"):
+        gb._geo_fill_and_verify(db, asof=ASOF, epochs=epochs)
+
+
 # ── 用例 3 补充:对不上经 CLI 失败路径 → error manifest、退出 1 ──
 
 def test_geo_mismatch_writes_error_manifest_nothing_published(
@@ -271,6 +523,15 @@ def test_geo_mismatch_writes_error_manifest_nothing_published(
     # 失败清单里带上补查进度(#444 评审 P3-7):查了几个、哪些例子不一致
     assert payload["geo_stats"]["looked_up"] >= 1
     assert "1.2.3.5" in " ".join(payload["geo_stats"]["mismatch_examples"])
+    # 例子带两边的值(P2-2):不用再上机复现就能看出差在哪
+    assert "入库=" in payload["error"] and "查询接口=" in payload["error"]
+    # 失败清单同样带漂移三项和「逐列核对过几个」(本轮没有源被重建)
+    assert payload["geo_stats"]["changed_sources"] == []
+    assert payload["geo_stats"]["drift_skipped"] == 0
+    assert payload["geo_stats"]["drift_examples"] == []
+    assert payload["geo_stats"]["verified"] == \
+        payload["geo_stats"]["looked_up"] - \
+        len(payload["geo_stats"]["mismatch_examples"])
     assert payload["scan_stats"]["units_total"] == UNIVERSE_TOTAL
     assert capsys.readouterr().out == ""   # 失败不往 stdout 打成功 manifest
 
