@@ -244,12 +244,12 @@ def test_write_error_manifest_only_touches_manifest(out_dir):
 
     emit_tiers.write_error_manifest(
         out_dir, "enrich failed: engine 500",
-        walk_stats={"units_total": 11}, elapsed_s=12.5)
+        scan_stats={"units_total": 11}, elapsed_s=12.5)
 
     payload = json.loads(
         (out_dir / "manifest.json").read_text(encoding="utf-8"))
     assert payload["error"] == "enrich failed: engine 500"
-    assert payload["walk_stats"] == {"units_total": 11}   # **ctx 透传
+    assert payload["scan_stats"] == {"units_total": 11}   # **ctx 透传
     assert payload["elapsed_s"] == 12.5
     assert datetime.fromisoformat(
         payload["generated_at"]).utcoffset() == timedelta(0)
