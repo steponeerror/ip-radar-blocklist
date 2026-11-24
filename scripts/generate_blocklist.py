@@ -225,7 +225,10 @@ def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float,
         须是入库 sources 去掉被重建源之后的子集(扫描没漏指控者);入库
         sources 去掉被重建源之后须落在这些观测的源名里(入库没有多出
         查询接口看不到的源);malicious 观测的分类须都在入库 classes 里
-        (入库 classes 可以多 —— 少掉的只能是随被重建源一起消失的分类)。
+        (入库 classes 可以多 —— 少掉的只能是随被重建源一起消失的分类);
+        没被重建的证人,如果是良性断言(会注进每个指控组)、或者它的分类
+        在入库 classes 里(所在的组扫描时是恶意组),须在入库 sources 里
+        (扫描没漏证人)。
         满足 = 这个地址只核对了没被重建的源(入库 sources 去掉被重建源
         之后为空 = 本轮没有核对),计入 drift_skipped 并记例子,不中止。
       - 其余对不上:扫描器或入库有问题,停(GeoMismatchError)。
@@ -246,13 +249,11 @@ def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float,
     enabled = list(_registry._enabled_sources())
     allowed = frozenset(s.name for s in enabled
                         if s.name not in _registry._PRIVATE)
+    # 只在 geo 开头读一次 ptr:下面的 lookup() 读的是 load_db() 这一刻开的
+    # 纪元,geo 途中再有源被重建也读不到新数据,重算认不出新的「被重建的
+    # 源」;反而可能把「geo 途中才被重建的源」上的真问题认成可以跳过
+    # (复评 P3-5)。
     changed = _sources_changed_since_scan(epochs or {}, enabled)
-
-    def changed_now() -> set[str]:
-        # 核对途中也可能有源被重建:每个对不上的地址重读一次 ptr,
-        # 不拿 geo 开头那一次的读数判(查询接口读的是 load_db() 时开的
-        # 纪元,与判定时刻一致,这里只是把「哪些源变了」认全)
-        return _sources_changed_since_scan(epochs or {}, enabled)
 
     columns = ("verdict", "confidence", "classes", "sources", "source_count")
     mismatches: list[str] = []
@@ -282,8 +283,8 @@ def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float,
                  for name, old, new in zip(columns, stored, computed)
                  if old != new]
         if parts:
-            changed = changed_now()
             stored_sources = _names(stored[3])
+            stored_classes = _names(stored[2])
             rebuilt = (stored_sources | _names(sources)) & changed
             if rebuilt:
                 # 证据里有被重建过的源:只核对没被重建的那部分(按观测比)
@@ -295,10 +296,21 @@ def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float,
                              if o.verdict != "malicious"}
                 kept_types = {o.classification_type
                               for o in kept.observations
-                              if o.verdict == "malicious"}
+                              if o.verdict == "malicious"
+                              and o.classification_type}
+                # 扫描时进过恶意组的证人(复评 P3-1):良性断言会注进每个
+                # 指控组;分类在入库 classes 里的证人,所在的组扫描时是
+                # 恶意组 —— 这两种证人扫描时都该进入库 sources
+                missing = {
+                    o.source for o in kept.observations
+                    if o.verdict != "malicious"
+                    and (o.verdict == "benign"
+                         or o.classification_type in stored_classes)
+                    and o.source not in stored_sources - changed}
                 if (accusers <= stored_sources - changed
                         and stored_sources - changed <= accusers | witnesses
-                        and kept_types <= _names(stored[2])):
+                        and kept_types <= stored_classes
+                        and not missing):
                     drift_skipped += 1
                     note = ("入库证据全部来自被重建的源,本轮没有核对"
                             if not stored_sources - changed

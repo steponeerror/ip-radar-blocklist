@@ -440,6 +440,25 @@ def test_geo_skip_still_requires_unchanged_accusers_in_stored_sources(
         gb._geo_fill_and_verify(db, asof=ASOF, epochs=stats["epochs"])
 
 
+def test_geo_skip_still_requires_unchanged_witnesses_in_stored_sources(
+        engine_env, monkeypatch):
+    """没被重建的证人(扫描时进过恶意组的)必须在入库 sources 里:1.2.3.5 的
+    tor 组扫描时有指控者 tor_accuser 和证人 danmeuk_tor;tor_accuser 之后
+    被重建(还列着 1.2.3.5),入库 sources 被抹到只剩 dataplane 和 turris ——
+    证人 danmeuk_tor 不见了 → 中止。"""
+    acc, rebuild = _add_tor_accuser(engine_env, monkeypatch, ["1.2.3.5"])
+    db = sqlite3.connect(":memory:")
+    create_units(db)
+    stats = su.scan_units(engine_env["data_dir"], db, asof=ASOF)
+    rebuild(["1.2.3.5", "1.2.3.8"])
+    db.execute("UPDATE units SET sources = 'dataplane;turris_greylist',"
+               " source_count = 2 WHERE ip = '1.2.3.5'")
+
+    with pytest.raises(gb.GeoMismatchError,
+                       match=r"1\.2\.3\.5.*sources"):
+        gb._geo_fill_and_verify(db, asof=ASOF, epochs=stats["epochs"])
+
+
 def test_geo_skip_still_rejects_stored_source_the_engine_never_returned(
         engine_env):
     """入库 sources 里有查询接口从来没给过的源(没被重建的 danmeuk_tor
