@@ -97,8 +97,10 @@ systemctl list-timers ipradar-blocklist.timer   # 核对下次触发点
 成功轮:`generated_at` / `tiers`(每档实际行数)/ `malicious_pool` /
 `peak_rss_mb`(ru_maxrss 总量,仅观测)/ `peak_rss_anon_mb`(红线口径,
 scan 阶段逐批采样与 geo 阶段采样两段的匿名内存最大值)/ `elapsed_s` / `stage_elapsed_s`(各阶段耗时)/
-`asof`(判定时刻,两个阶段共用)/ `epochs`(各库纪元号,变了就重跑)/
-`scan_stats`(单元数、恶意数、读了几条记录)/ `geo_stats`(补查了几个、这一段的匿名内存峰值)。
+`asof`(判定时刻,两个阶段共用)/ `epochs`(扫描开跑时各库的纪元号)/
+`scan_stats`(单元数、恶意数、读了几条记录)/ `geo_stats`(`looked_up` 补查了几个、
+`verified` 逐列核对过的有几个、`drift_skipped` 只核对了一部分的有几个、
+`drift_examples` 例子、`changed_sources` 扫描期间被重建过的源、这一段的匿名内存峰值)。
 **失败轮:`error` 键出现即本轮失败**(带 `[阶段]` 前缀),此时 systemd 单元
 为 failed、**未推送**;档位文件保持上一成功轮原样。处理:
 `journalctl -u ipradar-blocklist.service` 看容器 stderr 进度行定位阶段,
@@ -110,6 +112,14 @@ scan 阶段逐批采样与 geo 阶段采样两段的匿名内存最大值)/ `ela
 判定对不上(「geo 阶段判定核对失败」带例子的 IP 和列 —— 引擎扫描器与
 查询接口行为不一致,按报错找引擎侧)、RSS 超限(看 `error` 里的阶段)、
 token 失效(push 阶段,ExecStartPost)。
+
+**扫描期间有源被重建(每轮都可能有,不是故障)**:生产上扫描要跑一个多小时,
+期间引擎照常重建源(新纪元目录 + 换 ptr)。扫描读的是开跑时钉住的纪元,geo
+核对调的查询接口读的是现在的纪元;重建恰好改了某个进榜地址的证据时,这个
+地址的五列就对不上。核对规则:证据里有被重建过的源的地址,把被重建的源从
+两边去掉再比(查询接口只算没重建的源),一致就跳过它、计入 `drift_skipped`;
+其余地址逐列核对,对不上照样停。所以 `drift_skipped > 0` 且轮次成功是正常的,
+`changed_sources` 里是这一轮被重建过的源。档位文件按扫描时的快照出。
 
 ## 残余风险(如实记录)
 

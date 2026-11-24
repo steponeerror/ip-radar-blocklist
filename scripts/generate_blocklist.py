@@ -76,12 +76,41 @@ class GeoMismatchError(RuntimeError):
     这两个值(#444 评审 P3-7)。"""
 
     def __init__(self, message: str, *, looked_up: int,
-                 examples: list[str]):
+                 examples: list[str], changed_sources: list[str] = (),
+                 drift_skipped: int = 0,
+                 drift_examples: list[str] = ()):
         super().__init__(message)
         self.looked_up = looked_up
         self.examples = examples
+        # 扫描之后被重建过的源,以及因此只核对了未重建部分的地址
+        # (#444 生产试跑 2026-11-25);失败清单里一并带出
+        self.changed_sources = list(changed_sources)
+        self.drift_skipped = drift_skipped
+        self.drift_examples = list(drift_examples)
 
-    """geo 阶段五列核对失败:扫描入库判定与查询接口不一致。"""
+
+def _names(text: str | None) -> set[str]:
+    """分号连接的源名/分类名串 → 集合(空串、NULL → 空集)。"""
+    return set(text.split(";")) - {""} if text else set()
+
+
+def _sources_changed_since_scan(epochs: dict, sources) -> set[str]:
+    """扫描开跑之后被重建过的源名集合。
+
+    epochs = 扫描时钉住的各库纪元号(清单 scan_stats.epochs,来自扫描器
+    open_unit_scanner);现在的纪元号读 ptr 文件。两边不同 = 这个源在扫描
+    期间换过纪元(也可能已经不在启用名单里)。epochs 为空(调用方没给)
+    → 空集,核对保持逐列严格。"""
+    from ipdb._sources._lmdb import read_ptr
+    by_name = {s.name: s for s in sources}
+    changed: set[str] = set()
+    for name, pinned in epochs.items():
+        src = by_name.get(name)
+        now = ([None, None] if src is None else
+               [read_ptr(src._lmdb_base), read_ptr(src._lmdb6_base)])
+        if now != list(pinned):
+            changed.add(name)
+    return changed
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -153,7 +182,8 @@ def _ip_sort_key(ip: str) -> tuple:
 
 
 def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float,
-                         max_rss_mb: int = 140) -> dict:
+                         max_rss_mb: int = 140,
+                         epochs: dict | None = None) -> dict:
     """geo 阶段(#444):给进榜单 IP 补 asn/country,并核判定五列一致。
 
     进榜集合 = 档位会切的全部单 IP:嵌套档位取最大档位条数,排序键与
@@ -169,7 +199,21 @@ def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float,
     这一段自己也量匿名内存(load_db() 之后、补查途中每 500 个采一次),
     超过 max_rss_mb 同样停:容器的内存上限盖整轮,扫描阶段的读数代表不了
     这一段(#444 评审 P2-3)。
-    返回 geo_stats:{"looked_up", "elapsed_s", "peak_rss_anon_mb"}。
+
+    扫描期间源被重建(#444 生产试跑 2026-11-25):扫描读的是开跑时钉住
+    的纪元,这里 lookup() 读的是现在的纪元。生产上扫描要跑一个多小时,
+    引擎照常重建源,所以两边读到的不是同一份数据的情况每轮都可能有。
+    epochs(扫描时钉住的纪元)与现在的 ptr 不同 = 这个源被重建过。对不上
+    的地址分两种:
+      - 证据(入库的 sources ∪ 查询接口的 sources)里有被重建过的源:
+        把被重建的源从两边去掉再比 —— 查询接口只算没重建的源
+        (allowed_sources 减去它们),其源名集合必须等于入库 sources 减去
+        它们,其分类集合必须是入库 classes 的子集;满足 = 这个地址只核对
+        了没重建的那部分(drift_skipped 计数、记例子),不中止。
+      - 其余对不上:扫描器或入库有问题,停(GeoMismatchError)。
+    返回 geo_stats:{"looked_up", "verified", "drift_skipped", "drift_examples",
+    "changed_sources", "elapsed_s", "peak_rss_anon_mb"}。verified =
+    looked_up - drift_skipped = 逐列核对过的地址数。
     """
     started = time.monotonic()
     limit = max(emit_tiers.TIERS)
@@ -181,11 +225,15 @@ def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float,
     os.environ["IP_RADAR_POOL_CHILD"] = "1"
     from ipdb import load_db, lookup, _registry
     load_db()
-    allowed = frozenset(s.name for s in _registry._enabled_sources()
+    enabled = list(_registry._enabled_sources())
+    allowed = frozenset(s.name for s in enabled
                         if s.name not in _registry._PRIVATE)
+    changed = _sources_changed_since_scan(epochs or {}, enabled)
 
     columns = ("verdict", "confidence", "classes", "sources", "source_count")
     mismatches: list[str] = []
+    drift_examples: list[str] = []
+    drift_skipped = 0
     peak_anon = scan_units._current_anon_rss_mb()
     looked_up = 0
     for ip in candidates:
@@ -209,6 +257,19 @@ def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float,
         differing = [name for name, old, new in zip(columns, stored, computed)
                      if old != new]
         if differing:
+            stored_sources = _names(stored[3])
+            if (stored_sources | _names(sources)) & changed:
+                # 这个地址的证据里有扫描之后被重建过的源:只核对没重建的
+                # 那部分(两边都去掉被重建的源再比)
+                kept = lookup(ip, allowed_sources=allowed - changed,
+                              asof=asof).to_dict()
+                _, _, kept_classes, kept_sources, _, _, _ = \
+                    scan_units.extract_fields(kept)
+                if (_names(kept_sources) == stored_sources - changed
+                        and _names(kept_classes) <= _names(stored[2])):
+                    drift_skipped += 1
+                    drift_examples.append(f"{ip}: {', '.join(differing)}")
+                    continue
             mismatches.append(f"{ip}: {', '.join(differing)}")
             if len(mismatches) >= _MISMATCH_EXAMPLES:
                 break
@@ -219,8 +280,14 @@ def _geo_fill_and_verify(db: sqlite3.Connection, *, asof: float,
             "geo 阶段判定核对失败:扫描入库值与查询接口不一致(停下前查了"
             f"{looked_up} 个,列出前 {len(mismatches)} 例)—— "
             + "; ".join(mismatches),
-            looked_up=looked_up, examples=mismatches)
+            looked_up=looked_up, examples=mismatches,
+            changed_sources=sorted(changed), drift_skipped=drift_skipped,
+            drift_examples=drift_examples[:_MISMATCH_EXAMPLES])
     return {"looked_up": looked_up,
+            "verified": looked_up - drift_skipped,
+            "drift_skipped": drift_skipped,
+            "drift_examples": drift_examples[:_MISMATCH_EXAMPLES],
+            "changed_sources": sorted(changed),
             "elapsed_s": time.monotonic() - started,
             "peak_rss_anon_mb": peak_anon}
 
@@ -278,11 +345,15 @@ def main(argv: list[str] | None = None) -> int:
              f" elapsed_s={scan_stats['elapsed_s']:.1f}")
 
         stage = "geo"
-        geo_stats = _geo_fill_and_verify(db, asof=asof,
-                                         max_rss_mb=args.max_rss_mb)
+        geo_stats = _geo_fill_and_verify(
+            db, asof=asof, max_rss_mb=args.max_rss_mb,
+            epochs=scan_stats["epochs"])
         stage_s["geo"] = round(time.monotonic() - stage_started, 3)
         stage_started = time.monotonic()
         _log(f"[geo] looked_up={geo_stats['looked_up']}"
+             f" verified={geo_stats['verified']}"
+             f" drift_skipped={geo_stats['drift_skipped']}"
+             f" changed_sources={','.join(geo_stats['changed_sources'])}"
              f" peak_rss_anon_mb={geo_stats['peak_rss_anon_mb']:.1f}"
              f" elapsed_s={geo_stats['elapsed_s']:.1f}")
 
@@ -340,8 +411,12 @@ def main(argv: list[str] | None = None) -> int:
             ctx["geo_stats"] = geo_stats
         elif isinstance(exc, GeoMismatchError):
             # 核对失败时 geo_stats 还没返回:把停下之前的进度带出来
-            ctx["geo_stats"] = {"looked_up": exc.looked_up,
-                                "mismatch_examples": exc.examples}
+            ctx["geo_stats"] = {
+                "looked_up": exc.looked_up,
+                "mismatch_examples": exc.examples,
+                "drift_skipped": exc.drift_skipped,
+                "drift_examples": exc.drift_examples,
+                "changed_sources": exc.changed_sources}
         try:
             emit_tiers.write_error_manifest(out_dir, error, **ctx)
             payload = json.loads(
