@@ -1,211 +1,58 @@
-"""Task 4 tests — CLI orchestration: real subprocess end-to-end + failure path.
+"""#444 B 步集成测试 —— CLI 全管线(scan → geo → emit)。
 
-Fixture strategy = T1's real-shard 手法 + T2's real-protocol stub 手法:
+夹具(conftest):三个真源类(dataplane / turris_greylist 威胁类 +
+danmeuk_tor 资产类)在临时目录写原始文件 + rebuild() → 正版纪元/ptr
+LMDB 分片;夹具里有多源同一地址(1.2.3.5)、资产类证人、保留地址单元
+(10.99.99.1)、v4/v6 网段单元(5.6.7.0/24、2a00:1450:4001::/48)、
+只有资产类记录的地址(1.2.3.99,不产单元)。
 
-* engine shard: DataplaneSource / TurrisGreylistSource fed hand-written raw
-  files, then ``rebuild()`` → genuine epoch/ptr LMDB shards under a tmp data
-  dir. The CLI subprocess discovers them through the REAL ``ipdb`` registry
-  (no seam — unlike T1's unit tests nothing is monkeypatched across the
-  process boundary; every source without a shard is skipped silently).
-* stub API: stdlib ThreadingHTTPServer speaking the pinned NDJSON protocol
-  (start → row{idx,result} → progress → done), rows emitted out of order.
-* SUT: ``sys.executable scripts/generate_blocklist.py`` as a real subprocess
-  → exit code, stdout manifest, stderr progress lines, on-disk artifacts are
-  all observed from outside, exactly as cron/systemd would see them.
-
-Universe (7 units, shaped): 4 v4 /32 + 1 v6 /128 (dataplane raw) + 1 v4 CIDR
-+ 1 v6 CIDR (turris csv) → stub verdicts: 4 malicious (including the v6
-line; the v4-CIDR line stays counted in the pool but must NOT surface in
-any tier — 单 IP 口径, 2026-10-25), 1 suspicious, 2 benign — none of
-the latter may appear in any artifact.
-
-Auth (final-review P1): the stub optionally enforces the engine's key gate
-(`required_key=`) — happy path runs the CLI WITH --api-key against a
-key-requiring stub; a dedicated keyless run pins the 401 permanent-abort
-failure mode (error manifest, nothing published) forever.
+不再有 HTTP 桩(逐 IP 查询路径随 #444 删除,规格 Q2 不留回退):判定
+一致性改由「扫描入库值 vs 同进程 lookup()」对拍直接钉死(用例 2)。
+子进程用例(sys.executable scripts/generate_blocklist.py)从外面观察
+退出码、stdout/stderr、落盘产物 —— cron/systemd 看到什么就测什么。
 """
 import json
 import os
+import sqlite3
 import subprocess
 import sys
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
+from scripts import scan_units as su                  # noqa: E402
+from scripts import generate_blocklist as gb          # noqa: E402
+
+from conftest import (ASOF, ENGINE_BACKEND, MALICIOUS_TOTAL,  # noqa: E402
+                      SINGLE_MALICIOUS_POOL, UNIVERSE_TOTAL, create_units)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CLI = REPO_ROOT / "scripts" / "generate_blocklist.py"
-ENGINE_BACKEND = Path("/home/huxiao/dev/pi-ip-lookup-tool/backend")
 
 DEFAULT_TIERS = (100, 500, 1000, 5000, 10000)
 EXPECTED_ARTIFACTS = {f"top_{n}.{ext}" for n in DEFAULT_TIERS
                       for ext in ("txt", "csv")} | {"manifest.json"}
 
-# 排序全链端到端期望:sc=3 > sc=2 > sc=1(单 IP 口径:turris v4-CIDR
-# 恶意单元在池内但被档位排除)
-EXPECTED_ORDER = ["203.0.113.7", "203.0.113.5", "2001:db8::1"]
+# 排序全链端到端期望:sc=2 组内(5.6.7.9 与 1.2.3.5)confidence 并列,
+# last_seen DESC 定序;sc=1 组(1.2.3.7 与 2606:4700::1)同理
+EXPECTED_ORDER = ["5.6.7.9", "1.2.3.5", "1.2.3.7", "2606:4700::1"]
 
-DATA_PLANE_ROWS = [
-    "1513399|TEST AS|203.0.113.7|2026-10-05T00:00:00Z|sshpwauth",
-    "1513399|TEST AS|203.0.113.5|2026-10-01T00:00:00Z|sshpwauth",
-    "1513399|TEST AS|198.51.100.5|2026-10-02T00:00:00Z|dnsrd",   # suspicious
-    "64512|RES AS|192.0.2.1|2026-10-02T00:00:00Z|any",           # benign
-    "64512|V6 AS|2001:db8::1|2026-10-03T00:00:00Z|telnetlogin",  # malicious v6
+# 字节级钉死排序全链 + geo 补查回写(asn 胜者来自 dataplane;country 无
+# 地理源 → 引擎兜底值 N/A)+ 提取规则(只有 malicious 分类计数)
+EXPECTED_CSV_ROWS = [
+    "5.6.7.9,1513399,N/A,scanner,78,2,"
+    "2026-10-02T00:00:00Z,2026-10-02T00:00:00Z",
+    "1.2.3.5,1513399,N/A,brute-force;scanner,70,2,"
+    "2026-10-01T00:00:00Z,2026-10-01T00:00:00Z",
+    "1.2.3.7,1513399,N/A,brute-force,70,1,"
+    "2026-10-05T00:00:00Z,2026-10-05T00:00:00Z",
+    "2606:4700::1,64512,N/A,brute-force,70,1,"
+    "2026-10-03T00:00:00Z,2026-10-03T00:00:00Z",
 ]
-TURRIS_ROWS = ["198.51.100.0/24,smtp",       # malicious v4 CIDR
-               "2001:db8:aaaa::/48,telnet"]  # benign v6 CIDR
 
 
-# ── T1 手法:real source classes + raw file + rebuild() → 真分片 ──
-
-def _build_engine_shards(data_dir: Path) -> None:
-    from ipdb._sources.dataplane import DataplaneSource
-    from ipdb._sources.turris_greylist import TurrisGreylistSource
-    (data_dir / "dataplane.txt").write_text(
-        "\n".join(DATA_PLANE_ROWS) + "\n", encoding="utf-8")
-    DataplaneSource(data_dir).rebuild()
-    (data_dir / "turris_greylist.csv").write_text(
-        "Address,Tags\n" + "\n".join(TURRIS_ROWS) + "\n", encoding="utf-8")
-    TurrisGreylistSource(data_dir).rebuild()
-
-
-@pytest.fixture
-def data_dir(tmp_path):
-    d = tmp_path / "data"
-    d.mkdir()
-    _build_engine_shards(d)
-    return d
-
-
-# ── T2 手法:threaded stdlib stub speaking the pinned NDJSON protocol ──
-
-def _merge(value):
-    return {"value": value, "confidence": 90, "algorithm": "voting",
-            "sources": [{"source": "geo", "value": value,
-                         "reliability": 1.0, "authoritative": True}]}
-
-
-def _cls(type_, sources):
-    return {"type": type_, "verdict": "malicious", "detected": True,
-            "confidence": 80, "sources": [{"source": s, "value": True,
-                                           "reliability": 0.9} for s in sources]}
-
-
-def _row(ip, verdict, confidence, classifications=None, is_reserved=False):
-    return {"ip": ip, "country": _merge("US"), "asn": _merge("64512"),
-            "threat": {"verdict": verdict, "confidence": confidence,
-                       "types": [], "is_cdn": False},
-            "classifications": classifications or {}, "attributes": {},
-            "is_reserved": is_reserved}
-
-
-# 键 = 锚点形态(CIDR 单元剥前缀后引擎实际收到的东西)
-STUB_RESULTS = {
-    "203.0.113.7": _row("203.0.113.7", "malicious", 87, classifications={
-        "scanner": _cls("scanner", ["dataplane", "turris_greylist"]),
-        "spam": _cls("spam", ["dataplane", "blocklist_de"])}),
-    "203.0.113.5": _row("203.0.113.5", "malicious", 75, classifications={
-        "scanner": _cls("scanner", ["dataplane", "turris_greylist"])}),
-    "198.51.100.5": _row("198.51.100.5", "suspicious", 40, classifications={
-        "scanner": _cls("scanner", ["dataplane"])}),
-    "192.0.2.1": _row("192.0.2.1", "benign", 0, is_reserved=True),
-    "2001:db8::1": _row("2001:db8::1", "malicious", 60, classifications={
-        "bruteforce": _cls("bruteforce", ["dataplane"])}),
-    "198.51.100.0": _row("198.51.100.0", "malicious", 60, classifications={
-        "spam": _cls("spam", ["turris_greylist"])}),
-    "2001:db8:aaaa::": _row("2001:db8:aaaa::", "benign", 0),
-}
-
-
-def _ok_responder(attempt_no, ips, headers):
-    events = [{"type": "start", "total": len(ips)}]
-    for idx in reversed(range(len(ips))):      # 乱序行,逼真协议
-        events.append({"type": "row", "idx": idx,
-                       "result": STUB_RESULTS[ips[idx]]})
-    events.append({"type": "progress", "done": len(ips), "total": len(ips)})
-    events.append({"type": "done", "invalid_lines": 0, "ipv6_unsupported": 0})
-    payload = ("".join(json.dumps(e) + "\n" for e in events)).encode("utf-8")
-    return 200, "application/x-ndjson", payload
-
-
-class _Stub:
-    """responder(attempt_no, ips, headers) -> (status, ctype, payload);
-    required_key set → non-Bearer requests get the engine's 401 envelope
-    (mirrors api_key_dep: programmatic requests without a key fail)."""
-
-    def __init__(self, responder, required_key=None):
-        self.required_key = required_key
-        self.requests: list[list[str]] = []
-        self.auth_headers: list[str | None] = []
-        outer = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                body = self.rfile.read(
-                    int(self.headers.get("Content-Length", 0)))
-                ips = json.loads(body).get("ips", [])
-                outer.requests.append(ips)
-                outer.auth_headers.append(self.headers.get("Authorization"))
-                if (outer.required_key is not None
-                        and self.headers.get("Authorization")
-                        != f"Bearer {outer.required_key}"):
-                    payload = json.dumps(
-                        {"error": {"code": "unauthorized",
-                                   "message": "API key required for"
-                                              " programmatic access"}}
-                    ).encode("utf-8")
-                    self.send_response(401)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(payload)))
-                    self.end_headers()
-                    self.wfile.write(payload)
-                    return
-                status, ctype, payload = responder(
-                    len(outer.requests), ips, self.headers)
-                self.send_response(status)
-                self.send_header("Content-Type", ctype)
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
-
-            def log_message(self, *args):
-                pass
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(
-            target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-
-    @property
-    def base(self) -> str:
-        host, port = self.server.server_address
-        return f"http://{host}:{port}"
-
-    def stop(self):
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
-
-
-@pytest.fixture
-def stub():
-    s = None
-
-    def factory(responder, required_key=None):
-        nonlocal s
-        s = _Stub(responder, required_key=required_key)
-        return s
-
-    yield factory
-    if s is not None:
-        s.stop()
-
-
-# ── CLI 子进程(真实 sys.executable,环境不泄漏 IP_RADAR_DATA_DIR
-# 与 IPRADAR_API_KEY —— key 只允许经 --api-key 旗标进入被测进程)──
-
-def _run_cli(*flags: str, timeout: int = 120) -> subprocess.CompletedProcess:
+def _run_cli(*flags: str, timeout: int = 180) -> subprocess.CompletedProcess:
+    # 真实 sys.executable;环境不泄漏 IP_RADAR_DATA_DIR(旗标即真相)
     env = {k: v for k, v in os.environ.items()
            if k not in ("IP_RADAR_DATA_DIR", "IPRADAR_API_KEY")}
     return subprocess.run(
@@ -214,20 +61,17 @@ def _run_cli(*flags: str, timeout: int = 120) -> subprocess.CompletedProcess:
         timeout=timeout)
 
 
-# ── 成功路径:全管线一次真跑 ──
+# ── 用例 1:CLI 真子进程端到端 ──
 
-def test_cli_end_to_end_publishes_tiers_and_merged_manifest(
-        data_dir, stub, tmp_path):
+def test_cli_end_to_end_publishes_tiers_and_manifest(engine_env, tmp_path):
     out_dir = tmp_path / "out"
-    s = stub(_ok_responder, required_key="it-engine-key-1")
+    proc = _run_cli("--engine-path", ENGINE_BACKEND,
+                    "--data-dir", engine_env["data_dir"],
+                    "--out-dir", out_dir, "--asof", str(int(ASOF)))
 
-    proc = _run_cli("--engine-path", ENGINE_BACKEND, "--data-dir", data_dir,
-                    "--api-base", s.base, "--out-dir", out_dir,
-                    "--api-key", "it-engine-key-1")
-
-    assert proc.returncode == 0, f"stderr:\n{proc.stderr}"
+    assert proc.returncode == 0, f"stderr:\n{proc.stderr[-4000:]}"
     # 每阶段恰好一行带计数的进度(stderr;stdout 只允许 manifest JSON)
-    for stage in ("[walk]", "[enrich]", "[emit]"):
+    for stage in ("[scan]", "[geo]", "[emit]"):
         assert stage in proc.stderr
     manifest = json.loads(proc.stdout)
 
@@ -237,7 +81,7 @@ def test_cli_end_to_end_publishes_tiers_and_merged_manifest(
     # manifest 重写走 tmp + os.replace(原子),不留 .tmp 残渣
     assert not (out_dir / "manifest.json.tmp").exists()
 
-    # stdout manifest == 落盘 manifest;7 个 emit 必填字段 + CLI 合并 ctx
+    # stdout manifest == 落盘 manifest;emit 必填字段 + CLI 合并的新字段
     on_disk = json.loads(
         (out_dir / "manifest.json").read_text(encoding="utf-8"))
     assert on_disk == manifest
@@ -245,134 +89,205 @@ def test_cli_end_to_end_publishes_tiers_and_merged_manifest(
     for field in ("generated_at", "tiers", "universe", "malicious_pool",
                   "malicious_single_ip", "cidr_units", "units_v6",
                   "first_seen_coverage",
-                  "walk_stats", "enrich_stats", "elapsed_s", "peak_rss_mb",
-                  "peak_rss_anon_mb", "api_base"):
+                  "asof", "epochs", "scan_stats", "geo_stats",
+                  "stage_elapsed_s", "elapsed_s", "peak_rss_mb",
+                  "peak_rss_anon_mb"):
         assert field in manifest, field
-    assert manifest["universe"] == 7
-    assert manifest["malicious_pool"] == 4
-    assert manifest["malicious_single_ip"] == 3   # 档位实际切档的池
-    assert manifest["cidr_units"] == 1            # 198.51.100.0/24(池内)
-    assert manifest["units_v6"] == 1              # 2001:db8::1(池内)
-    assert manifest["first_seen_coverage"] == pytest.approx(3 / 4)
-    assert manifest["walk_stats"]["first_seen_coverage"] == pytest.approx(5 / 7)
-    assert manifest["tiers"] == {str(n): 3 for n in DEFAULT_TIERS}
-    assert manifest["walk_stats"]["units_total"] == 7
-    assert manifest["walk_stats"]["units_v6"] == 2
-    assert manifest["walk_stats"]["cidr_units"] == 2
-    assert manifest["walk_stats"]["per_source"] == {
-        "dataplane": 5, "turris_greylist": 2}
-    assert manifest["enrich_stats"]["queried"] == 7
-    assert manifest["enrich_stats"]["malicious"] == 4
-    assert manifest["enrich_stats"]["requests"] == 1
-    assert manifest["enrich_stats"]["rate_limited"] == 0
-    assert manifest["api_base"] == s.base
+    # 开跑时刻钉死:--asof 原样进清单
+    assert manifest["asof"] == ASOF
+    assert manifest["universe"] == UNIVERSE_TOTAL
+    assert manifest["malicious_pool"] == MALICIOUS_TOTAL
+    assert manifest["malicious_single_ip"] == SINGLE_MALICIOUS_POOL
+    assert manifest["cidr_units"] == 2            # 5.6.7.0/24、2a00:...::/48
+    assert manifest["units_v6"] == 2              # v6 恶意池(单 + 网段)
+    assert manifest["tiers"] == {str(n): SINGLE_MALICIOUS_POOL
+                                 for n in DEFAULT_TIERS}
+
+    # scan_stats:单元数(v4/v6/单地址/网段)、扫描器自报分解、恶意数、
+    # 读了几条记录、时刻锚
+    scan_stats = manifest["scan_stats"]
+    assert scan_stats["units_total"] == UNIVERSE_TOTAL
+    assert scan_stats["units_v4"] == 5
+    assert scan_stats["units_v6"] == 2
+    assert scan_stats["units_single"] == 5
+    assert scan_stats["units_cidr"] == 2
+    assert scan_stats["scanner_units"] == {"v4_single": 4, "v4_cidr": 1,
+                                           "v6_single": 1, "v6_cidr": 1}
+    assert scan_stats["malicious"] == MALICIOUS_TOTAL
+    assert scan_stats["records_total"] == 10
+    assert scan_stats["skipped_anomalies"] == 0
+    assert scan_stats["asof"] == ASOF
+
+    # 各库纪元号进清单(扫描器逐源报 [v4, v6];无分片的源是
+    # [None, None],照实透传 —— 夹具在子进程里经真 registry 发现,只有
+    # 三个夹具源有库,纪元都是 1)
+    assert manifest["epochs"]["dataplane"] == [1, 1]
+    assert manifest["epochs"]["turris_greylist"] == [1, 1]
+    assert manifest["epochs"]["danmeuk_tor"] == [1, 1]
+    assert manifest["epochs"] == scan_stats["epochs"]
+
+    # geo_stats:进榜单 IP 全量补查
+    assert manifest["geo_stats"]["looked_up"] == SINGLE_MALICIOUS_POOL
+    for key in ("scan", "geo", "emit"):
+        assert manifest["stage_elapsed_s"][key] > 0
     assert manifest["elapsed_s"] > 0
     assert manifest["peak_rss_mb"] > 0
-    # T7:匿名口径峰值随 enrich 采样进 manifest(enrich_stats 内同名字段)
     assert manifest["peak_rss_anon_mb"] > 0
-    assert manifest["enrich_stats"]["peak_rss_anon_mb"] > 0
 
-    # 单次整批请求(7 单位 < chunk 2500),锚点形态(CIDR 剥前缀、v6 原样);
-    # 批内顺序是 LMDB 键序(游标枚举),契约只钉集合不钉顺序
-    assert len(s.requests) == 1
-    # Bearer 头全程携带(stub 的 required_key 门即反证)
-    assert s.auth_headers == ["Bearer it-engine-key-1"]
-    assert sorted(s.requests[0]) == sorted([
-        "203.0.113.7", "203.0.113.5", "198.51.100.5", "192.0.2.1",
-        "2001:db8::1", "198.51.100.0", "2001:db8:aaaa::"])
-
-    # 字节级钉死排序全链 + v6 行在产物里、CIDR 被档位排除 + up to N(单 IP 池 3)
+    # 字节级钉死排序全链 + 档位无 CIDR 行 + 嵌套档位是超集(up to N,池 4)
     expected_txt = ("\n".join(EXPECTED_ORDER) + "\n").encode("utf-8")
+    tier_sets = []
     for n in DEFAULT_TIERS:
-        assert (out_dir / f"top_{n}.txt").read_bytes() == expected_txt
-    raw_csv = (out_dir / "top_100.csv").read_bytes()
-    assert raw_csv.split(b"\n")[0] == (b"ip,asn,country,classes,confidence,"
-                                       b"source_count,first_seen,"
-                                       b"last_seen")
-    # dataplane 双填 first_seen = last_seen → 含 first_seen 值的行
-    assert ("2001:db8::1,64512,US,bruteforce,80,1,"
-            "2026-10-03T00:00:00Z,2026-10-03T00:00:00Z"
-            in (out_dir / "top_100.csv").read_text(encoding="utf-8"))
+        txt = (out_dir / f"top_{n}.txt").read_bytes()
+        assert txt == expected_txt
+        assert b"/" not in txt                    # 档位里没有 CIDR 行
+        tier_sets.append(set(txt.decode().split()))
+    assert (tier_sets[0] <= tier_sets[1] <= tier_sets[2]
+            <= tier_sets[3] <= tier_sets[4])
+    csv_lines = (out_dir / "top_100.csv").read_text(
+        encoding="utf-8").splitlines()
+    assert csv_lines[0] == ("ip,asn,country,classes,confidence,"
+                            "source_count,first_seen,last_seen")
+    assert csv_lines[1:] == EXPECTED_CSV_ROWS
 
-    # suspicious / benign 单元绝不出现在任何产物;CIDR 恶意单元同样被
-    # 档位排除(单 IP 口径),只在 manifest 计数里可见
+    # 保留地址单元 / 资产only 地址 / 网段单元文本绝不出现在任何产物
     for name in EXPECTED_ARTIFACTS - {"manifest.json"}:
         body = (out_dir / name).read_text(encoding="utf-8")
-        for absent in ("198.51.100.5", "192.0.2.1", "2001:db8:aaaa::/48",
-                       "198.51.100.0/24"):
+        for absent in ("10.99.99.1", "1.2.3.99",
+                       "5.6.7.0/24", "2a00:1450:4001::/48"):
             assert absent not in body, (name, absent)
 
 
-def test_cli_local_anchor_data_dir_flag_drives_registry(data_dir, stub,
-                                                       tmp_path):
+def test_cli_local_anchor_data_dir_flag_drives_registry(engine_env, tmp_path):
     """--data-dir 旗标是引擎 registry 的唯一数据来源:父进程即便泄漏了
-    别的 IP_RADAR_DATA_DIR,子进程也按旗标走(7 单位宇宙,而非别的)。"""
+    别的 IP_RADAR_DATA_DIR,子进程也按旗标走(7 单元宇宙,而非别的)。"""
     out_dir = tmp_path / "out2"
-    s = stub(_ok_responder)
     env = {k: v for k, v in os.environ.items()
            if k not in ("IP_RADAR_DATA_DIR", "IPRADAR_API_KEY")}
     env["IP_RADAR_DATA_DIR"] = "/nonexistent-data-dir"
     proc = subprocess.run(
         [sys.executable, str(CLI), "--engine-path", str(ENGINE_BACKEND),
-         "--data-dir", str(data_dir), "--api-base", s.base,
-         "--out-dir", str(out_dir)],
-        capture_output=True, text=True, cwd=REPO_ROOT, env=env, timeout=120)
-    assert proc.returncode == 0, f"stderr:\n{proc.stderr}"
-    assert json.loads(proc.stdout)["walk_stats"]["units_total"] == 7
+         "--data-dir", str(engine_env["data_dir"]),
+         "--out-dir", str(out_dir), "--asof", str(int(ASOF))],
+        capture_output=True, text=True, cwd=REPO_ROOT, env=env, timeout=180)
+    assert proc.returncode == 0, f"stderr:\n{proc.stderr[-4000:]}"
+    assert json.loads(proc.stdout)["scan_stats"]["units_total"] == \
+        UNIVERSE_TOTAL
 
 
-# ── 失败路径:引擎恒 500 → 重试耗尽 → error manifest,无半成品 ──
+# ── 用例 2:对拍(扫描入库值 vs 同进程 lookup)──
 
-def test_cli_engine_always_500_writes_error_manifest_nothing_published(
-        data_dir, stub, tmp_path):
+def test_scan_rows_match_inprocess_lookup(engine_env):
+    """夹具数据目录上,units 表每一行的五列与同进程
+    lookup(网络地址, asof=同一时刻).to_dict() 经 extract_fields 算出的
+    一样;行数等于扫描器的单元数。"""
+    db = sqlite3.connect(":memory:")
+    create_units(db)
+    stats = su.scan_units(engine_env["data_dir"], db, asof=ASOF)
+
+    # 扫描句柄已关,同进程才能 load_db(py-lmdb 同路径禁双开);
+    # IP_RADAR_POOL_CHILD=1 防 load_db 清旧纪元目录
+    os.environ["IP_RADAR_POOL_CHILD"] = "1"
+    from ipdb import load_db, lookup, _registry
+    load_db()
+    allowed = frozenset(s.name for s in _registry._enabled_sources()
+                        if s.name not in _registry._PRIVATE)
+
+    rows = list(db.execute(
+        "SELECT ip, verdict, confidence, classes, sources, source_count"
+        " FROM units"))
+    assert stats["units_total"] == UNIVERSE_TOTAL
+    assert stats["scanner_units"] == {"v4_single": 4, "v4_cidr": 1,
+                                      "v6_single": 1, "v6_cidr": 1}
+    assert len(rows) == sum(stats["scanner_units"].values())
+    for ip, *stored in rows:
+        addr = ip.partition("/")[0]     # 网段单元在网络地址上判定
+        r = lookup(addr, allowed_sources=allowed, asof=ASOF).to_dict()
+        assert tuple(stored) == tuple(su.extract_fields(r)[:5]), ip
+
+    # 保留地址行:单元产出、判定 benign、数值列 NULL;资产only 地址不产单元
+    assert db.execute("SELECT verdict, confidence FROM units"
+                      " WHERE ip = '10.99.99.1'").fetchone() == ("benign", None)
+    assert db.execute("SELECT COUNT(*) FROM units WHERE ip = '1.2.3.99'"
+                      ).fetchone()[0] == 0
+
+
+# ── 用例 3:判定对不上就停(直接调 geo 函数)──
+
+def test_geo_verdict_mismatch_aborts(engine_env):
+    """表里某一行的 confidence 改掉再跑 geo 阶段 → 抛错,错误信息里有
+    那个 IP 和列名。"""
+    db = sqlite3.connect(":memory:")
+    create_units(db)
+    su.scan_units(engine_env["data_dir"], db, asof=ASOF)
+    db.execute("UPDATE units SET confidence = confidence + 1"
+               " WHERE ip = '1.2.3.5'")
+
+    with pytest.raises(gb.GeoMismatchError,
+                       match=r"1\.2\.3\.5.*confidence"):
+        gb._geo_fill_and_verify(db, asof=ASOF)
+
+
+# ── 用例 3 补充:对不上经 CLI 失败路径 → error manifest、退出 1 ──
+
+def test_geo_mismatch_writes_error_manifest_nothing_published(
+        engine_env, tmp_path, monkeypatch, capsys):
+    """geo 阶段判定对不上 → error manifest、退出 1、不发布任何档位文件。
+    lookup 打桩偏移恶意分类置信度(只影响 geo 侧;扫描侧诚实入库,
+    两边必不一致)。"""
     out_dir = tmp_path / "out"
+    import ipdb
+    real_lookup = ipdb.lookup
 
-    def always_500(attempt_no, ips, headers):
-        return 500, "application/json", json.dumps(
-            {"error": {"code": "internal",
-                       "message": "engine on fire"}}).encode("utf-8")
+    def skewed(ip, *args, **kwargs):
+        result = real_lookup(ip, *args, **kwargs)
+        for cls in result.classifications.values():
+            if cls.detected and cls.verdict == "malicious":
+                cls.confidence = cls.confidence + 7
+                break
+        return result
 
-    s = stub(always_500)
-    proc = _run_cli("--engine-path", ENGINE_BACKEND, "--data-dir", data_dir,
-                    "--api-base", s.base, "--out-dir", out_dir, timeout=180)
+    monkeypatch.setattr(ipdb, "lookup", skewed)
 
-    assert proc.returncode == 1
-    # 初次 + 3 次退避重试 = 4 次尝试(真实 2/4/8s 退避在跑)
-    assert len(s.requests) == 4
-    # 首跑无产物:out_dir 只有 error manifest,stdout 不打印成功 JSON
+    rc = gb.main([
+        "--engine-path", str(ENGINE_BACKEND),
+        "--data-dir", str(engine_env["data_dir"]),
+        "--out-dir", str(out_dir),
+        "--asof", str(int(ASOF)),
+    ])
+
+    assert rc == 1
     assert [p.name for p in out_dir.iterdir()] == ["manifest.json"]
-    # error manifest 同样原子换入,无 .tmp 残渣
-    assert not (out_dir / "manifest.json.tmp").exists()
     payload = json.loads(
         (out_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert "engine on fire" in payload["error"]
-    assert "enrich" in payload["error"]              # 失败阶段可辨认
-    assert payload["walk_stats"]["units_total"] == 7  # 部分统计透传
-    assert "error" in proc.stderr                     # error manifest → stderr
-    assert proc.stdout == ""
+    assert "confidence" in payload["error"]
+    assert "1.2.3.5" in payload["error"]
+    assert payload["stage"] == "geo"
+    assert payload["scan_stats"]["units_total"] == UNIVERSE_TOTAL
+    assert capsys.readouterr().out == ""   # 失败不往 stdout 打成功 manifest
 
 
-# ── 失败路径(final-review P1 钉死):无 key 调鉴权引擎 → 401 永久中止 ──
+# ── 用例 4:引擎镜像太旧 ──
 
-def test_cli_missing_api_key_401_permanent_abort_error_manifest(
-        data_dir, stub, tmp_path):
-    """keyless 运行撞引擎 api_key_dep:401 信封不重试、不进
-    429 容忍路径,直接永久失败 → error manifest、无半成品、
-    退出码 1。把 P1 的失败形态永久钉死在套件里。"""
+def test_cli_engine_without_scan_module_fails_loud(engine_env, tmp_path):
+    """引擎镜像早于 #444(fake engine 目录没有 ipdb/_scan.py)→ CLI
+    退出 1、写 error manifest、不发布任何档位文件。"""
+    fake = tmp_path / "fakeengine"
+    (fake / "ipdb" / "_sources").mkdir(parents=True)
+    (fake / "ipdb" / "__init__.py").write_text("", encoding="utf-8")
+    (fake / "ipdb" / "_sources" / "__init__.py").write_text("", encoding="utf-8")
+    (fake / "ipdb" / "_sources" / "_lmdb.py").write_text("", encoding="utf-8")
     out_dir = tmp_path / "out"
-    s = stub(_ok_responder, required_key="it-engine-key-1")
 
-    proc = _run_cli("--engine-path", ENGINE_BACKEND, "--data-dir", data_dir,
-                    "--api-base", s.base, "--out-dir", out_dir)
+    proc = _run_cli("--engine-path", fake,
+                    "--data-dir", engine_env["data_dir"],
+                    "--out-dir", out_dir)
 
     assert proc.returncode == 1
-    assert len(s.requests) == 1          # 401 是永久错:不重试
-    assert s.auth_headers == [None]      # 真的没带 key
-    assert [p_.name for p_ in out_dir.iterdir()] == ["manifest.json"]
+    assert [p.name for p in out_dir.iterdir()] == ["manifest.json"]
     payload = json.loads(
         (out_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert "401" in payload["error"]
-    assert "enrich" in payload["error"]              # 失败阶段可辨认
-    assert payload["walk_stats"]["units_total"] == 7  # 部分统计透传
+    assert "引擎镜像早于 #444" in payload["error"]
+    assert payload["stage"] == "scan"
     assert "error" in proc.stderr
     assert proc.stdout == ""
