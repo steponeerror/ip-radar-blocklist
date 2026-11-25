@@ -86,18 +86,49 @@ def compute_stats(rows) -> dict:
     }
 
 
-def compose_text(stats: dict, pool_total, label: str) -> str:
+def compose_text(stats: dict, pool_total, label: str,
+                 data_line: bool = True, class_limit: int = 3) -> str:
     cc = " · ".join(f"{flag(c) or ''} {c} {n}".strip() for c, n in stats["countries"])
-    cls = " · ".join(f"{k} {v}" for k, v in stats["classes"])
+    cls = " · ".join(f"{k} {v}" for k, v in stats["classes"][:class_limit])
     pool = f"{pool_total:,}" if isinstance(pool_total, int) else str(pool_total)
-    return (f"🛡️ ip-radar daily blocklist — {label}\n\n"
-            f"{cc}\n"
-            f"{cls} · avg conf {stats['avg_conf']}/100\n"
-            f"Tracking {pool} malicious IPs\n\n"
-            f"CSV: {CSV_URL}\n"
-            f"Repo: {REPO_URL}\n"
-            f"Data: ip-radar consensus engine\n\n"
-            f"{HASHTAGS}")
+    lines = [
+        f"🛡️ ip-radar daily blocklist — {label}",
+        "",
+        cc,
+        f"{cls} · avg conf {stats['avg_conf']}/100",
+        f"Tracking {pool} malicious IPs",
+        "",
+        f"CSV: {CSV_URL}",
+        f"Repo: {REPO_URL}",
+    ]
+    if data_line:
+        lines.append("Data: ip-radar consensus engine")
+    lines += ["", HASHTAGS]
+    return "\n".join(lines)
+
+
+# 文案超长时的缩短顺序(#449:2026-11-25 生产文案加权 282 > 280,模板没留余量
+# —— 恶意池 7 位数、类名 scanner/ddos/brute-force 这类长名字就超)。Data 行去掉
+# 不丢信息(附图页脚 FOOTER_TEXT 已有同样的字);类名收到前两名保国家/池数/链接。
+# 顺序:完整 → 去 Data 行 → 类名收前两名 → 两样都做;仍超才由调用方放弃。
+_SHORTEN_STEPS = (
+    ("full", {}, "完整文案"),
+    ("no-data-line", {"data_line": False}, "去掉 Data 行"),
+    ("top2-classes", {"class_limit": 2}, "类名收到前两名"),
+    ("no-data-line+top2-classes", {"data_line": False, "class_limit": 2},
+     "去掉 Data 行 + 类名收到前两名"),
+)
+
+
+def compose_text_within_budget(stats: dict, pool_total, label: str) -> tuple:
+    """按 _SHORTEN_STEPS 顺序返回第一个不超预算的文案 → (文案, 步骤名, 人话名)。
+    全超时返回最后一步(最短的那个),由调用方按旧口径放弃。"""
+    text, name, human = "", "", ""
+    for name, kw, human in _SHORTEN_STEPS:
+        text = compose_text(stats, pool_total, label, **kw)
+        if weighted_len(text) <= MAX_WEIGHTED_LEN:
+            break
+    return text, name, human
 
 
 # ---------------------------------------------------------------- 附图
@@ -204,8 +235,10 @@ def main() -> int:
     pool = json.load(open(repo / "manifest.json")).get("malicious_pool")
 
     today = beijing_today()
-    text = compose_text(compute_stats(rows), pool, date_label(today))
+    text, step, step_human = compose_text_within_budget(compute_stats(rows), pool, date_label(today))
     wl = weighted_len(text)
+    if step != "full":
+        print(f"[tweet] 文案超长,已缩短({step_human}):加权 {wl}/{MAX_WEIGHTED_LEN}")
     print(f"[tweet] 文案(加权 {wl}/{MAX_WEIGHTED_LEN} 字符):\n{text}\n")
     if wl > MAX_WEIGHTED_LEN:
         print("[tweet] 文案超长 — 放弃(检查列宽/类名异常)", file=sys.stderr)
