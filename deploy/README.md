@@ -6,14 +6,16 @@
 ## 运行形态
 
 ```
-systemd timer (每日 04:30, Persistent=true)
+systemd timer (每日 21:00 UTC,即北京 05:00,Persistent=true;一轮约 1.7 小时)
   └─ ipradar-blocklist.service (Type=oneshot, root, idle 优先级)
        ├─ ExecStart:     docker compose run --rm blocklist-exporter
        │                  (容器: 挂引擎 LMDB 只读卷按键序扫描
        │                   scan → geo → emit(#444),产物写 /repo =
        │                   /opt/ip-radar-blocklist)
-       └─ ExecStartPost: deploy/push.sh
-                          (宿主机: commit → PAT 推 main,stderr 抹除 token)
+       ├─ ExecStartPost: deploy/push.sh
+       │                  (宿主机: 调 GitHub Release 接口建当天的 Release 并上传档位;
+       │                   说明里带本轮的核对读数)
+       └─ ExecStartPost: deploy/tweet.py(Release 成功后发推;当天发过则跳过)
 ```
 
 **为什么生成与推送分离**:PAT(fine-grained,仅本仓 Contents RW)只存在于
@@ -77,8 +79,8 @@ systemctl list-timers ipradar-blocklist.timer   # 核对下次触发点
   语义」)之外作机器保险:**fail-small —— 爆顶只死
   导出器,绝不拖垮引擎**。
 - `restart: "no"`:一次性日任务。卡死的导出器自旋重启只会反复烧 CPU/内存;
-  死了就等下一轮 timer。systemd 侧 `TimeoutStartSec=2h` 同理是守门,非预期
-  运行时长。
+  死了就等下一轮 timer。systemd 侧 `TimeoutStartSec=4h` 同理是守门,非预期
+  运行时长(一轮约 1.7 小时)。
 
 ## 可调环境变量(compose 插值)
 
@@ -125,12 +127,15 @@ token 失效(push 阶段,ExecStartPost)。
 清单和代码里的 `drift` 指的就是这件事(扫描与核对之间纪元变了)。注意:
 入库证据全部来自被重建源的地址,等于本轮没有核对,例子里会明说
 「本轮没有核对」。规格(docs 仓 research/2026-11-24-blocklist-scan-export-spec.md)
-Q6 原来写的是「纪元变了就重跑」,已被这条规则取代(2026-11-25,待用户确认)。
+Q6 原来写的是「纪元变了就重跑」,已被这条规则取代(2026-11-25 用户确认)。
+跳过的比例不设硬上限(同日用户裁:硬上限会让导出停更),三个数写进每天 Release 的说明。
+
+停更了没人知道是真实发生过的事:2026-11-16、11-17 两晚轮次被 4h 上限杀掉,
+断更两天后才发现;之后定时器有意停到 #444 做完(11-18 到 11-25)。
+每日 Release 说明里的核对读数、`manifest.json` 的 `generated_at` 是判断导出
+是否活着的两个地方(自动的新鲜度检查见 ip-radar 仓 #448)。
 
 ## 残余风险(如实记录)
 
-- 推送进行中的几秒,内嵌 token 的 URL 出现在 `git push` 进程 `/proc` cmdline
-  (默认 Linux 对其他本机用户可读 root 进程 cmdline);单管理员机器已接受,
-  详见 push.sh 内注释。stderr 抹除已改用 perl 从 `%ENV` 读 token(`\Q\E` 原样
-  引用,凭据含正则元字符也安全),抹除器自身 argv 不再携带 token。
-- `git config safe.directory` 仅在 git 拒绝时按需加入,且只加本仓路径。
+- 推送用的 PAT 只在宿主机(`curl` 调 Release 接口,不再 `git push`),不出现在
+  容器、compose 文件、镜像和日志里(push.sh 不开 `set -x`)。

@@ -29,9 +29,28 @@ if [[ "$TAG_STATUS" == "200" ]]; then
     exit 0
 fi
 
-# 池摘要(Release body;\n 是 JSON 转义换行——裸换行会让 JSON 非法 400)
-POOL=$(python3 -c "import json; print(json.load(open('manifest.json')).get('malicious_pool','?'))" 2>/dev/null || echo "?")
-BODY="Daily IP blocklist export from the ip-radar consensus engine.\n\n- Malicious pool: ${POOL} entries\n- Tiers: 100 / 500 / 1000 / 5000 / 10000 (nested)\n- Generated: ${DATE} (UTC)"
+# 池摘要与核对读数(Release body)。读数来自本轮清单的 geo_stats(#444):
+# 查了几个进榜地址、逐列核对一致几个、因扫描期间有源被重建而只核对了一部分几个
+# —— 跳过的比例不设硬上限(用户 2026-11-25 裁:硬上限会让导出停更),写在这里让人看见。
+# \n 是 JSON 转义换行——裸换行会让 JSON 非法 400,所以 python 输出的是两个字符的 \n。
+# 读不到清单字段就写「?」,说明缺一行不该挡住发布。
+READOUT=$(python3 - <<'PY' 2>/dev/null
+import json
+m = json.load(open('manifest.json'))
+g = m.get('geo_stats') or {}
+def n(key):
+    v = g.get(key)
+    return '?' if not isinstance(v, int) else str(v)
+lines = [
+    f"- Malicious pool: {m.get('malicious_pool', '?')} entries",
+    f"- Geo check: {n('verified')} of {n('looked_up')} looked-up addresses verified column by column; "
+    f"{n('drift_skipped')} partially verified (sources rebuilt during the scan)",
+    f"- As of: {m.get('generated_at', '?')}",
+]
+print('\\n'.join(lines))
+PY
+) || READOUT='- Malicious pool: ?'
+BODY="Daily IP blocklist export from the ip-radar consensus engine.\n\n${READOUT}\n- Tiers: 100 / 500 / 1000 / 5000 / 10000 (nested)\n- Release date: ${DATE}"
 
 # 创建 Release
 RELEASE_RESP=$(curl -sf -X POST \
