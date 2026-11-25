@@ -44,8 +44,9 @@ def n(key):
 lines = [
     f"- Malicious pool: {m.get('malicious_pool', '?')} entries",
     f"- Geo check: {n('verified')} of {n('looked_up')} looked-up addresses verified column by column; "
-    f"{n('drift_skipped')} partially verified (sources rebuilt during the scan)",
-    f"- As of: {m.get('generated_at', '?')}",
+    f"{n('drift_skipped')} checked only against the sources not rebuilt during the scan "
+    f"(some of them not checked at all)",
+    f"- Manifest generated at (UTC): {m.get('generated_at', '?')}",
 ]
 print('\\n'.join(lines))
 PY
