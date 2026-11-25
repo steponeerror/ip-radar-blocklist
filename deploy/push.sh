@@ -64,7 +64,11 @@ if [[ $PREFLIGHT == 1 ]]; then
         exit 1
     fi
     if [[ "$CODE" != "200" ]]; then
-        echo "[push.sh] 预检:token 无效或已过期(HTTP $CODE)" >&2
+        if [[ "$CODE" == "429" || "$CODE" =~ ^5[0-9][0-9]$ ]]; then
+            echo "[push.sh] 预检:GitHub 那边出了问题(HTTP $CODE),过一会儿再试 — 放弃" >&2
+        else
+            echo "[push.sh] 预检:token 无效或已过期(HTTP $CODE)" >&2
+        fi
         exit 1
     fi
     RESP=$(gh_curl -s -o /dev/null -w '%{http_code}' \
@@ -77,7 +81,11 @@ if [[ $PREFLIGHT == 1 ]]; then
         exit 1
     fi
     if [[ "$CODE" != "200" ]]; then
-        echo "[push.sh] 预检:token 访问不到仓库(HTTP $CODE)" >&2
+        if [[ "$CODE" == "429" || "$CODE" =~ ^5[0-9][0-9]$ ]]; then
+            echo "[push.sh] 预检:GitHub 那边出了问题(HTTP $CODE),过一会儿再试 — 放弃" >&2
+        else
+            echo "[push.sh] 预检:token 访问不到仓库(HTTP $CODE)" >&2
+        fi
         exit 1
     fi
     echo "[push.sh] 预检通过:token 可用、仓库可读(能不能建 Release 要到真正创建时才知道)"

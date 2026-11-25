@@ -25,7 +25,7 @@ TimeoutStartSec=4h
 # 失败轮绝不推送,错误态只留在容器外的 manifest.json 里。
 # 预检(#449):token 读不到、无效/过期、访问不到仓库时很快失败(通常 1 秒内),
 # 不再白跑 100 分钟生成才发现。预检连不上 GitHub(自带重试两次,最多约一两分钟)
-# 时这一轮不生成、不发,网络恢复后手动 systemctl start 本服务补跑。
+# 时这一轮不生成、不发,网络恢复后手动 systemctl start 本服务补跑;最坏等两三分钟。
 # 注意预检挡不住「权限不够建 Release」
 # —— fine-grained token /user 和仓库都读得到但建 Release 被 403,那种
 # 只能等生成跑完在推送这步失败(journal 里有 HTTP 403 和提示)。

@@ -38,7 +38,11 @@ if [[ "$MODE" == "create_net_down" && "$*" == *"api.github.com/repos/"*"/release
 fi
 
 if [[ "$*" == *"https://api.github.com/user"* ]]; then
-    if [[ "$MODE" == "user_401" ]]; then printf '401'; else printf '200'; fi
+    case "$MODE" in
+        user_401) printf '401' ;;
+        user_503) printf '503' ;;   # GitHub 那边出问题:不能说成 token 的事
+        *) printf '200' ;;
+    esac
     exit 0
 fi
 if [[ "$*" == *"/releases/tags/"* ]]; then
@@ -122,6 +126,17 @@ def test_preflight_user_401(stub_env):
     r = _run(env, "--preflight")
     assert r.returncode == 1
     assert "HTTP 401" in r.stderr
+
+
+def test_preflight_github_5xx_is_not_blamed_on_the_token(stub_env):
+    """GitHub 自己 5xx 时,码照打,但话不能说成「token 无效或已过期」。"""
+    env = dict(stub_env["env"])
+    env["STUB_MODE"] = "user_503"
+    r = _run(env, "--preflight")
+    assert r.returncode == 1
+    assert "HTTP 503" in r.stderr
+    assert "GitHub 那边" in r.stderr
+    assert "token 无效" not in r.stderr
 
 
 def test_preflight_network_down_says_cannot_reach(stub_env):

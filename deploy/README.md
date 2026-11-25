@@ -71,7 +71,7 @@ docker compose -f deploy/docker-compose.exporter.yml --profile export \
 
 # 7. 安装并启用 timer
 cp deploy/ipradar-blocklist.service deploy/ipradar-blocklist.timer /etc/systemd/system/
-#(单元文件改了,要重新 cp 这一行再 daemon-reload —— /etc 里是拷贝,不是链接)
+# (单元文件改了,要重新 cp 这一行再 daemon-reload —— /etc 里是拷贝,不是链接)
 systemctl daemon-reload
 systemctl enable --now ipradar-blocklist.timer
 systemctl list-timers ipradar-blocklist.timer   # 核对下次触发点
@@ -156,10 +156,9 @@ Q6 原来写的是「纪元变了就重跑」,已被这条规则取代(2026-11-2
 
 | 失败 | 何时暴露 | journal 里看什么 |
 |---|---|---|
-| token 读不到 / 无效或过期 / 访问不到仓库 | `ExecStartPre` 预检,**通常 1 秒内**失败,不进生成(不白跑 100 分钟) | 读不到:`[push.sh] 推送 token 读不到(…)— 放弃`;其余:`[push.sh] 预检:…(HTTP <码>)` |
+| token 读不到 / 无效或过期 / 访问不到仓库 | `ExecStartPre` 预检,**通常 1 秒内**失败,不进生成(不白跑 100 分钟) | 读不到:`[push.sh] 推送 token 读不到(…)— 放弃`;其余:`[push.sh] 预检:…(HTTP <码>)`;GitHub 自己 429/5xx 时写的是「GitHub 那边出了问题」 |
 | token 没有 Contents 写权限(建 Release 被拒 403) | 生成跑完后建 Release 那步失败 —— 预检只验读,验不出这个 | `[push.sh] 建 Release 失败:HTTP 403 — <接口 message>` + 「Contents: Read and write」提示 |
-| 连不上 GitHub API(断网、DNS、超时) | 预检自带重试两次,网络不通时最多一两分钟失败,**这一轮不生成、不发**;网络恢复后手动 `systemctl start ipradar-blocklist.service` 补跑。也可能在查 tag、建 Release、上传档位时失败(后两处不重试、不加超时,沿用旧行为) | `[push.sh] …GitHub API 调用没完成(curl 退出码 <n>;多半是连不上或传输中断)` |
-
+| 连不上 GitHub API(断网、DNS、超时) | 预检自带重试两次,最坏等两三分钟才失败,**这一轮不生成、不发**;网络恢复后手动 `systemctl start ipradar-blocklist.service` 补跑。也可能在查 tag、建 Release、上传档位时失败(后两处不重试、不加超时,沿用旧行为) | `[push.sh] …GitHub API 调用没完成(curl 退出码 <n>;多半是连不上或传输中断)` |
 
 前两种的修复都是换/补 token(建法见安装步骤第 5 步:只选本仓,Permissions 里
 **Contents: Read and write**,Metadata: Read 自动带)。
