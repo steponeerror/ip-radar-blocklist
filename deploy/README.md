@@ -18,6 +18,10 @@ systemd timer (每日 21:00 UTC,即北京 05:00,Persistent=true;一轮约 1.7–
        └─ ExecStartPost: deploy/tweet.py(Release 成功后发推;当天发过则跳过)
 ```
 
+推文文案超长时的缩短顺序(#449 起):先去掉 `Data: ip-radar consensus engine`
+行(附图页脚已有同样的字),再把类名从前三名收到前两名;两样都做还超才放弃
+发推(不影响已发布的 Release)。实际用了哪一种写在 `[tweet]` 日志行里。
+
 **为什么生成与推送分离**:PAT(fine-grained,仅本仓 Contents RW)只存在于
 宿主机 `/root/.config/blocklist-push.token`(0600)。容器只拿只读数据卷和
 rw 仓目录,**token 永不进容器环境/compose 文件/镜像** —— 即便容器被攻破也
@@ -121,7 +125,8 @@ scan 阶段逐批采样与 geo 阶段采样两段的匿名内存最大值)/ `ela
 `drift_examples` 里的是按规则跳过的地址;`mismatch_examples` 里停下来
 的,不论涉不涉及扫描之后被重建的源,都是没被重建的那部分对不上,按报错
 里的值找引擎侧)、RSS 超限(看 `error` 里的阶段)、
-token 失效(push 阶段,ExecStartPost)。
+token 无效或过期(现在由 ExecStartPre 预检 1 秒内拦下,见下面的
+「发布侧失败模式」)。
 
 **扫描期间有源被重建(每轮都可能有,不是故障)**:生产上扫描要跑一个多小时,
 期间引擎照常重建源(新纪元目录 + 换 ptr)。扫描读的是开跑时钉住的纪元,geo
@@ -140,6 +145,16 @@ Q6 原来写的是「纪元变了就重跑」,已被这条规则取代(2026-11-2
 断更两天后才发现;之后定时器有意停到 #444 做完(11-18 到 11-25)。
 每日 Release 说明里的核对读数、`manifest.json` 的 `generated_at` 是判断导出
 是否活着的两个地方(自动的新鲜度检查见 ip-radar 仓 #448)。
+
+## 发布侧失败模式(token,#449)
+
+| 失败 | 何时暴露 | journal 里看什么 |
+|---|---|---|
+| token 读不到 / 无效或过期 / 访问不到仓库 | `ExecStartPre` 预检,**1 秒内**失败,不进生成(不白跑 100 分钟) | `[push.sh] 预检:…(HTTP <码>)` |
+| token 没有 Contents 写权限(建 Release 被拒 403) | 生成跑完后建 Release 那步失败 —— 预检只验读,验不出这个 | `[push.sh] 建 Release 失败:HTTP 403 — <接口 message>` + 「Contents: Read and write」提示 |
+
+两种的修复都是换/补 token(见安装步骤第 5 步:Permissions 里
+**Contents: Read and write**,Metadata: Read 自动带)。
 
 ## 残余风险(如实记录)
 

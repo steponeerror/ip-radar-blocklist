@@ -23,6 +23,11 @@ TimeoutStartSec=4h
 # 生成:一次性容器(跑完 --rm 自删;restart: "no" 见 compose 注释)。
 # ExecStart 非零退出(管线失败)→ 本单元 failed,ExecStartPost 不执行 ——
 # 失败轮绝不推送,错误态只留在容器外的 manifest.json 里。
+# 预检(#449):token 读不到、无效/过期、访问不到仓库时 1 秒内失败,
+# 不再白跑 100 分钟生成才发现。注意预检挡不住「权限不够建 Release」
+# —— fine-grained token /user 和仓库都读得到但建 Release 被 403,那种
+# 只能等生成跑完在推送这步失败(journal 里有 HTTP 403 和提示)。
+ExecStartPre=/opt/ip-radar-blocklist/deploy/push.sh --preflight
 ExecStart=/usr/bin/docker compose -f /opt/ip-radar-blocklist/deploy/docker-compose.exporter.yml --profile export run --rm blocklist-exporter
 
 # 推送:仅在生成成功后于宿主机执行(PAT 只在宿主机,永不进容器)。
