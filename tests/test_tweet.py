@@ -3,6 +3,8 @@
 纯离线:不 import requests/PIL 之外的第三方(附图用例 importorskip PIL)。
 网络层(upload/post)不在此测 — 上线验收由手动真推覆盖。
 """
+import csv
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,6 +81,58 @@ def test_compose_text_long_classnames_still_within_budget():
             for _ in range(100)]
     text = tweet.compose_text(tweet.compute_stats(rows), 251821, "Oct 6")
     assert tweet.weighted_len(text) <= tweet.MAX_WEIGHTED_LEN, text
+
+
+# ---------------------------------------------------------------- #449 缩短顺序
+
+def _today_stats():
+    # 2026-11-25 生产这组数:完整模板加权 282 > 280,tweet.py 按旧口径放弃发推
+    return {
+        "countries": [("DE", 25), ("NL", 20), ("RO", 20)],
+        "classes": [("scanner", 100), ("ddos", 98), ("brute-force", 92)],
+        "avg_conf": 99,
+    }
+
+
+def test_compose_today_numbers_within_budget_after_shortening():
+    text, step, step_human = tweet.compose_text_within_budget(_today_stats(), 2335102, "Nov 25")
+    assert tweet.weighted_len(text) <= tweet.MAX_WEIGHTED_LEN, text
+    assert step == "no-data-line"  # 完整模板超了(282);按顺序先去掉 Data 行就够了
+    # 国家、恶意池总数、两个链接、话题标签都要留着
+    for cc in ("DE", "NL", "RO"):
+        assert cc in text
+    assert "2,335,102" in text
+    assert tweet.CSV_URL in text and tweet.REPO_URL in text
+    assert tweet.HASHTAGS in text
+
+
+def test_compose_beyond_shortening_returns_shortest_still_over():
+    # 连缩短都救不回:返回最后一步(最短变体),长度仍超 → 调用方按旧口径放弃
+    stats = {"countries": [("DE", 25), ("NL", 20), ("RO", 20)],
+             "classes": [("x" * 250, 100)],
+             "avg_conf": 99}
+    text, step, step_human = tweet.compose_text_within_budget(stats, 2335102, "Nov 25")
+    assert tweet.weighted_len(text) > tweet.MAX_WEIGHTED_LEN
+    assert step == "no-data-line+top2-classes"
+
+
+def test_main_gives_up_exit_1_when_even_shortened_over(tmp_path):
+    # 端到端:超长类名 → tweet.py --dry 退出码 1,发生在渲染附图/碰网络之前
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    long_cls = "x" * 250
+    rows = [_row(ip=f"10.0.0.{i}", classes=f"blacklist;{long_cls}") for i in range(3)]
+    with open(repo / "top_100.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    (repo / "manifest.json").write_text('{"malicious_pool": 2335102}', encoding="utf-8")
+    r = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "deploy" / "tweet.py"),
+         "--dry", "--repo", str(repo), "--out", str(tmp_path / "t.png")],
+        capture_output=True, text=True, timeout=60)
+    assert r.returncode == 1
+    assert "放弃" in r.stderr
 
 
 # ---------------------------------------------------------------- 附图
