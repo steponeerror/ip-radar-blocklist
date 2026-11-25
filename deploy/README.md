@@ -1,19 +1,21 @@
 # deploy/ — 服务器部署资产(ip-radar-blocklist 每日导出)
 
-服务器(demo,964Mi RAM)上的一键部署包:**容器生成、宿主机推送**。
+服务器(生产站,964Mi RAM)上的一键部署包:**容器生成、宿主机推送**。
 本目录只交付资产;部署本身是操作人动作,按下述步骤执行。
 
 ## 运行形态
 
 ```
-systemd timer (每日 04:30, Persistent=true)
+systemd timer (每日 21:00 UTC,即北京 05:00,Persistent=true;一轮约 1.7–2 小时)
   └─ ipradar-blocklist.service (Type=oneshot, root, idle 优先级)
        ├─ ExecStart:     docker compose run --rm blocklist-exporter
        │                  (容器: 挂引擎 LMDB 只读卷按键序扫描
        │                   scan → geo → emit(#444),产物写 /repo =
        │                   /opt/ip-radar-blocklist)
-       └─ ExecStartPost: deploy/push.sh
-                          (宿主机: commit → PAT 推 main,stderr 抹除 token)
+       ├─ ExecStartPost: deploy/push.sh
+       │                  (宿主机: 调 GitHub Release 接口建当天的 Release 并上传档位;
+       │                   说明里带本轮的核对读数)
+       └─ ExecStartPost: deploy/tweet.py(Release 成功后发推;当天发过则跳过)
 ```
 
 **为什么生成与推送分离**:PAT(fine-grained,仅本仓 Contents RW)只存在于
@@ -23,7 +25,7 @@ rw 仓目录,**token 永不进容器环境/compose 文件/镜像** —— 即便
 
 **#444 改版:导出不再调引擎查询接口**(2026-11-25):管线改按键序扫描
 引擎 LMDB(scan → geo → emit,规格 docs/research/2026-11-24-blocklist-scan-
-export-spec.md §5),全程只读库文件,引擎 API、原引擎查询 key
+export-spec.md §5;在 ip-radar 仓的嵌套 docs 仓里),全程只读库文件,引擎 API、原引擎查询 key
 (IPRADAR_API_KEY)与配速(IPRADAR_REQUEST_INTERVAL_S)一并废除 ——
 历史置备的 blocklist-engine.env 可删。前提:引擎镜像必须含 #444
 (backend/ipdb/_scan.py);旧镜像在 scan 阶段报「引擎镜像早于 #444」
@@ -69,6 +71,12 @@ systemctl list-timers ipradar-blocklist.timer   # 核对下次触发点
 手工触发一轮:`systemctl start ipradar-blocklist.service`;
 日志(含 manifest JSON):`journalctl -u ipradar-blocklist.service -f`。
 
+停过之后恢复:`systemctl is-enabled ipradar-blocklist.timer` 看一眼,再
+`systemctl enable --now ipradar-blocklist.timer`(Persistent=true 会立刻补跑错过的那一轮)。
+单元若带 drop-in 指向 `EnvironmentFile=…`(本机历史上为旧查询 key 加过
+`engine-key.conf`):这个写法不带 `-` 前缀,文件不存在时单元起不来(journal 里是
+「Failed to load environment files」)——要删那个 env 文件,先删 drop-in(或给前缀加 `-`)。
+
 ## 内存红线(为什么是 150m / restart "no")
 
 - 服务器总内存 964Mi,常驻仅 ~124Mi 可用;引擎栈(ipradar + caddy)必须优先活。
@@ -77,8 +85,8 @@ systemctl list-timers ipradar-blocklist.timer   # 核对下次触发点
   语义」)之外作机器保险:**fail-small —— 爆顶只死
   导出器,绝不拖垮引擎**。
 - `restart: "no"`:一次性日任务。卡死的导出器自旋重启只会反复烧 CPU/内存;
-  死了就等下一轮 timer。systemd 侧 `TimeoutStartSec=2h` 同理是守门,非预期
-  运行时长。
+  死了就等下一轮 timer。systemd 侧 `TimeoutStartSec=4h` 同理是守门,非预期
+  运行时长(一轮约 1.7–2 小时)。
 
 ## 可调环境变量(compose 插值)
 
@@ -88,7 +96,7 @@ systemctl list-timers ipradar-blocklist.timer   # 核对下次触发点
 
 引擎代码与数据路径:导出器复用镜像 `ipradar:latest`,引擎 backend 直接用镜像
 内烤入的 `/app/backend`(引擎 compose 从仓根 context 构建,baked 即权威版本,
-不再从宿主 bind 覆盖 —— 与数据卷同理,消除路径猜测。
+不再从宿主 bind 覆盖 —— 与数据卷同理,消除路径猜测)。
 
 另:推送 token 可用 env `BLOCKLIST_PUSH_TOKEN` 临时覆盖 token 文件。
 
@@ -125,12 +133,18 @@ token 失效(push 阶段,ExecStartPost)。
 清单和代码里的 `drift` 指的就是这件事(扫描与核对之间纪元变了)。注意:
 入库证据全部来自被重建源的地址,等于本轮没有核对,例子里会明说
 「本轮没有核对」。规格(docs 仓 research/2026-11-24-blocklist-scan-export-spec.md)
-Q6 原来写的是「纪元变了就重跑」,已被这条规则取代(2026-11-25,待用户确认)。
+Q6 原来写的是「纪元变了就重跑」,已被这条规则取代(2026-11-25 用户确认)。
+跳过的比例不设硬上限(同日用户裁:硬上限会让导出停更),三个数写进每天 Release 的说明。
+
+停更了没人知道是真实发生过的事:2026-11-16、11-17 两晚轮次被 4h 上限杀掉,
+断更两天后才发现;之后定时器有意停到 #444 做完(11-18 到 11-25)。
+每日 Release 说明里的核对读数、`manifest.json` 的 `generated_at` 是判断导出
+是否活着的两个地方(自动的新鲜度检查见 ip-radar 仓 #448)。
 
 ## 残余风险(如实记录)
 
-- 推送进行中的几秒,内嵌 token 的 URL 出现在 `git push` 进程 `/proc` cmdline
-  (默认 Linux 对其他本机用户可读 root 进程 cmdline);单管理员机器已接受,
-  详见 push.sh 内注释。stderr 抹除已改用 perl 从 `%ENV` 读 token(`\Q\E` 原样
-  引用,凭据含正则元字符也安全),抹除器自身 argv 不再携带 token。
-- `git config safe.directory` 仅在 git 拒绝时按需加入,且只加本仓路径。
+- 推送用的 PAT 只在宿主机(`curl` 调 Release 接口,不再 `git push`),不出现在
+  容器、compose 文件、镜像和日志里(push.sh 不开 `set -x`)。它以
+  `-H "Authorization: Bearer …"` 传给 curl,在该进程的 `/proc/<pid>/cmdline` 里看得到
+  (查 tag、建 Release、每传一个档位文件各一次;默认本机其他用户可读);单管理员
+  机器已接受。要消掉可以改用 curl 7.55 以上的 `-H @file`(宿主 curl 版本没核过),另开。
