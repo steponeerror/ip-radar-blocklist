@@ -152,9 +152,12 @@ Q6 原来写的是「纪元变了就重跑」,已被这条规则取代(2026-11-2
 |---|---|---|
 | token 读不到 / 无效或过期 / 访问不到仓库 | `ExecStartPre` 预检,**1 秒内**失败,不进生成(不白跑 100 分钟) | `[push.sh] 预检:…(HTTP <码>)` |
 | token 没有 Contents 写权限(建 Release 被拒 403) | 生成跑完后建 Release 那步失败 —— 预检只验读,验不出这个 | `[push.sh] 建 Release 失败:HTTP 403 — <接口 message>` + 「Contents: Read and write」提示 |
+| 连不上 GitHub API(断网、DNS、超时) | 预检 1 秒内失败;或查 tag、建 Release、上传档位时失败 | `[push.sh] …连不上 GitHub API(curl 退出码 <n>)` |
 
-两种的修复都是换/补 token(见安装步骤第 5 步:Permissions 里
-**Contents: Read and write**,Metadata: Read 自动带)。
+
+前两种的修复都是换/补 token(见安装步骤第 5 步:Permissions 里
+**Contents: Read and write**,Metadata: Read 自动带)。连不上是网络问题,等下一轮,或手动
+`systemctl start ipradar-blocklist.service`。
 
 ## 残余风险(如实记录)
 
@@ -162,4 +165,4 @@ Q6 原来写的是「纪元变了就重跑」,已被这条规则取代(2026-11-2
   容器、compose 文件、镜像和日志里(push.sh 不开 `set -x`)。它以
   `-H "Authorization: Bearer …"` 传给 curl,在该进程的 `/proc/<pid>/cmdline` 里看得到
   (查 tag、建 Release、每传一个档位文件各一次;默认本机其他用户可读);单管理员
-  机器已接受。要消掉可以改用 curl 7.55 以上的 `-H @file`(宿主 curl 版本没核过),另开。
+  机器已接受。要消掉可以改用 curl 7.55 以上的 `-H @file`(宿主 curl 是 7.68.0,支持),另开。

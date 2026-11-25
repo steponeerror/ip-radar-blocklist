@@ -36,17 +36,40 @@ if ! TOKEN="$(read_token)"; then
     exit 1
 fi
 
+# gh_curl(#449):包一层 curl,输出 = curl 的输出 + 末尾一行 curl 的退出码。
+# 传输层失败(断网、DNS、超时)时 curl 退出码非 0,输出里只有 000 或空 —— 退出码
+# 经输出带回来(函数在 $( ) 里跑,改不了外层变量),让每个调用点走「不是 2xx」的
+# 分支并打出原因。不包的话 set -e 会让脚本带着 curl 的退出码静默退出,和今天被
+# 吞掉的 403 一样看不见。
+gh_curl() {
+    local out rc
+    out=$(curl "$@") && rc=0 || rc=$?
+    printf '%s\n%s' "$out" "$rc"
+}
+
 # --preflight(#449):坏 token 1 秒内失败,不再白跑 100 分钟生成才发现。
 # 放在 cd/manifest 检查之前:预检只看 token,与产物无关。
 if [[ $PREFLIGHT == 1 ]]; then
-    CODE=$(curl -s -o /dev/null -w '%{http_code}' \
-        -H "Authorization: Bearer $TOKEN" https://api.github.com/user || true)
+    RESP=$(gh_curl -s -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer $TOKEN" https://api.github.com/user)
+    CURL_RC=$(printf '%s' "$RESP" | tail -n 1)
+    CODE=$(printf '%s' "$RESP" | sed '$d')
+    if [[ "$CURL_RC" != 0 ]]; then
+        echo "[push.sh] 预检:连不上 GitHub API(curl 退出码 $CURL_RC)— 放弃" >&2
+        exit 1
+    fi
     if [[ "$CODE" != "200" ]]; then
         echo "[push.sh] 预检:token 无效或已过期(HTTP $CODE)" >&2
         exit 1
     fi
-    CODE=$(curl -s -o /dev/null -w '%{http_code}' \
-        -H "Authorization: Bearer $TOKEN" "$REPO_API" || true)
+    RESP=$(gh_curl -s -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer $TOKEN" "$REPO_API")
+    CURL_RC=$(printf '%s' "$RESP" | tail -n 1)
+    CODE=$(printf '%s' "$RESP" | sed '$d')
+    if [[ "$CURL_RC" != 0 ]]; then
+        echo "[push.sh] 预检:连不上 GitHub API(curl 退出码 $CURL_RC)— 放弃" >&2
+        exit 1
+    fi
     if [[ "$CODE" != "200" ]]; then
         echo "[push.sh] 预检:token 访问不到仓库(HTTP $CODE)" >&2
         exit 1
@@ -64,9 +87,15 @@ if [[ ! -f manifest.json ]]; then
 fi
 
 # 判断今天是否已发过(tag 已存在则跳过)
-TAG_STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+RESP=$(gh_curl -s -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bearer $TOKEN" \
     "$REPO_API/releases/tags/$TAG")
+CURL_RC=$(printf '%s' "$RESP" | tail -n 1)
+TAG_STATUS=$(printf '%s' "$RESP" | sed '$d')
+if [[ "$CURL_RC" != 0 ]]; then
+    echo "[push.sh] 查今天的 tag 失败:连不上 GitHub API(curl 退出码 $CURL_RC)— 放弃" >&2
+    exit 1
+fi
 if [[ "$TAG_STATUS" == "200" ]]; then
     echo "[push.sh] $TAG 已存在 — 跳过(如需重发先手动删除 Release + tag)"
     exit 0
@@ -106,16 +135,21 @@ except Exception: print('')" 2>/dev/null
 
 # 创建 Release。不用 curl -f:#449 生产教训 —— -f 把 403 的错误正文吞了,
 # journal 只剩 status=22,看不出是 token 权限问题。改拿 HTTP 码 + message。
-RELEASE_RESP=$(curl -s -w '\n%{http_code}' -X POST \
+RELEASE_RESP=$(gh_curl -s -w '\n%{http_code}' -X POST \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
     "$REPO_API/releases" \
     -d "{\"tag_name\":\"$TAG\",\"name\":\"Blocklist $DATE\",\"body\":\"$BODY\",\"prerelease\":false,\"make_latest\":\"true\"}")
-HTTP_CODE=$(printf '%s' "$RELEASE_RESP" | tail -n 1)
-RELEASE_BODY=$(printf '%s' "$RELEASE_RESP" | sed '$d')
+CURL_RC=$(printf '%s' "$RELEASE_RESP" | tail -n 1)
+HTTP_CODE=$(printf '%s' "$RELEASE_RESP" | sed '$d' | tail -n 1)
+RELEASE_BODY=$(printf '%s' "$RELEASE_RESP" | sed '$d' | sed '$d')
 if [[ "$HTTP_CODE" != "201" ]]; then
     MSG="$(api_message "$RELEASE_BODY")"
-    echo "[push.sh] 建 Release 失败:HTTP $HTTP_CODE — ${MSG:-<接口无 message 字段>}" >&2
+    if [[ "$CURL_RC" != 0 ]]; then
+        echo "[push.sh] 建 Release 失败:HTTP $HTTP_CODE — 连不上 GitHub API 或传输中断(curl 退出码 $CURL_RC)" >&2
+    else
+        echo "[push.sh] 建 Release 失败:HTTP $HTTP_CODE — ${MSG:-<接口无 message 字段>}" >&2
+    fi
     if [[ "$HTTP_CODE" == "403" ]]; then
         echo "[push.sh] HTTP 403 多半是 token 没有建 Release 的权限:fine-grained token 需要 Contents: Read and write(见 deploy/README.md 第 5 步)" >&2
     fi
@@ -131,18 +165,23 @@ for f in "${FILES[@]}"; do
         echo "[push.sh] WARNING: $f 不存在,跳过" >&2
         continue
     fi
-    RESP=$(curl -s -w '\n%{http_code}' \
+    RESP=$(gh_curl -s -w '\n%{http_code}' \
         -X POST \
         -H "Authorization: Bearer $TOKEN" \
         -H "Content-Type: application/octet-stream" \
         --data-binary @"$f" \
         "${UPLOAD_URL}?name=$f")
-    STATUS=$(printf '%s' "$RESP" | tail -n 1)
+    CURL_RC=$(printf '%s' "$RESP" | tail -n 1)
+    STATUS=$(printf '%s' "$RESP" | sed '$d' | tail -n 1)
     if [[ "$STATUS" == "201" ]]; then
         echo "[push.sh] uploaded: $f ($(wc -c < "$f") bytes)"
     else
-        MSG="$(api_message "$(printf '%s' "$RESP" | sed '$d')")"
-        echo "[push.sh] FAILED to upload $f (HTTP $STATUS)${MSG:+ — $MSG}" >&2
+        if [[ "$CURL_RC" != 0 ]]; then
+            echo "[push.sh] FAILED to upload $f:连不上 GitHub API 或传输中断(curl 退出码 $CURL_RC)" >&2
+        else
+            MSG="$(api_message "$(printf '%s' "$RESP" | sed '$d' | sed '$d')")"
+            echo "[push.sh] FAILED to upload $f (HTTP $STATUS)${MSG:+ — $MSG}" >&2
+        fi
         exit 1
     fi
 done

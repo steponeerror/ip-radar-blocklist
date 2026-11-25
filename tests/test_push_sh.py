@@ -30,6 +30,13 @@ set -u
 printf '%s\\n' "$*" >> "${CURL_LOG:?CURL_LOG 未设置}"
 MODE="${STUB_MODE:-}"
 
+# net_down:curl 传输层失败的样子 —— 退出码 7(连不上),-w 的 http_code 是 000
+if [[ "$MODE" == "net_down" ]]; then printf '000'; exit 7; fi
+# create_net_down:只有「建 Release」那一次调用连不上(查 tag 正常)
+if [[ "$MODE" == "create_net_down" && "$*" == *"api.github.com/repos/"*"/releases"* && "$*" != *"/releases/tags/"* ]]; then
+    printf '\n000'; exit 7
+fi
+
 if [[ "$*" == *"https://api.github.com/user"* ]]; then
     if [[ "$MODE" == "user_401" ]]; then printf '401'; else printf '200'; fi
     exit 0
@@ -112,6 +119,38 @@ def test_preflight_user_401(stub_env):
     r = _run(env, "--preflight")
     assert r.returncode == 1
     assert "HTTP 401" in r.stderr
+
+
+def test_preflight_network_down_says_cannot_reach(stub_env):
+    """连不上 GitHub API 时要说「连不上」并带 curl 退出码,不能说成 token 过期。"""
+    env = dict(stub_env["env"])
+    env["STUB_MODE"] = "net_down"
+    r = _run(env, "--preflight")
+    assert r.returncode == 1
+    assert "连不上" in r.stderr
+    assert "退出码 7" in r.stderr
+    assert "过期" not in r.stderr
+
+
+def test_tag_check_network_down_reports_instead_of_silent_exit(stub_env):
+    """查 tag 那一步连不上:以前被 set -e 静默杀掉(退出码 7、一行字都没有)。"""
+    env = dict(stub_env["env"])
+    env["STUB_MODE"] = "net_down"
+    r = _run(env)
+    assert r.returncode == 1
+    assert "查今天的 tag" in r.stderr
+    assert "连不上" in r.stderr
+    assert "退出码 7" in r.stderr
+
+
+def test_create_release_network_down_reports_http_000(stub_env):
+    env = dict(stub_env["env"])
+    env["STUB_MODE"] = "create_net_down"
+    r = _run(env)
+    assert r.returncode == 1
+    assert "建 Release 失败" in r.stderr
+    assert "HTTP 000" in r.stderr
+    assert "退出码 7" in r.stderr
 
 
 # ---------------------------------------------------------------- 建 Release
