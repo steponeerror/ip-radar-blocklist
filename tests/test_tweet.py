@@ -97,7 +97,7 @@ def _today_stats():
 def test_compose_today_numbers_within_budget_after_shortening():
     text, step, step_human = tweet.compose_text_within_budget(_today_stats(), 2335102, "Nov 25")
     assert tweet.weighted_len(text) <= tweet.MAX_WEIGHTED_LEN, text
-    assert step != "full"  # 完整模板确实超了(282),这条路径必须用到缩短
+    assert step == "no-data-line"  # 完整模板超了(282);按顺序先去掉 Data 行就够了
     # 国家、恶意池总数、两个链接、话题标签都要留着
     for cc in ("DE", "NL", "RO"):
         assert cc in text

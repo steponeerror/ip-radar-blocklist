@@ -109,19 +109,19 @@ def compose_text(stats: dict, pool_total, label: str,
 
 # 文案超长时的缩短顺序(#449:2026-11-25 生产文案加权 282 > 280,模板没留余量
 # —— 恶意池 7 位数、类名 scanner/ddos/brute-force 这类长名字就超)。Data 行去掉
-# 不丢信息(附图页脚 FOOTER_TEXT 已有同样的字);类名收到前两名保国家/池数/链接。
+# 不丢信息(附图页脚 FOOTER_TEXT 已署名 ip-radar);类名只留前两名保国家/池数/链接。
 # 顺序:完整 → 去 Data 行 → 类名收前两名 → 两样都做;仍超才由调用方放弃。
 _SHORTEN_STEPS = (
     ("full", {}, "完整文案"),
     ("no-data-line", {"data_line": False}, "去掉 Data 行"),
-    ("top2-classes", {"class_limit": 2}, "类名收到前两名"),
+    ("top2-classes", {"class_limit": 2}, "类名只留前两名"),
     ("no-data-line+top2-classes", {"data_line": False, "class_limit": 2},
-     "去掉 Data 行 + 类名收到前两名"),
+     "去掉 Data 行 + 类名只留前两名"),
 )
 
 
 def compose_text_within_budget(stats: dict, pool_total, label: str) -> tuple:
-    """按 _SHORTEN_STEPS 顺序返回第一个不超预算的文案 → (文案, 步骤名, 人话名)。
+    """按 _SHORTEN_STEPS 顺序返回第一个不超预算的文案 → (文案, 步骤名, 给人看的名字)。
     全超时返回最后一步(最短的那个),由调用方按旧口径放弃。"""
     text, name, human = "", "", ""
     for name, kw, human in _SHORTEN_STEPS:

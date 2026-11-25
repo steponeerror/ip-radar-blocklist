@@ -53,7 +53,7 @@ if [[ "$*" == *"https://uploads.github.com/"* ]]; then
     if [[ "$MODE" == "upload_500" && "$*" == *"name=top_500.txt"* ]]; then
         printf '{"message":"Boom"}\\n500'
     else
-        printf '201'
+        printf '{"id":1}\\n201'   # 真 GitHub 上传成功会带一段 JSON 正文
     fi
     exit 0
 fi
@@ -72,7 +72,7 @@ exit 1
 
 @pytest.fixture
 def stub_env(tmp_path):
-    """假 curl + 假仓目录(清单 + 十个档位)+ 定向环境。"""
+    """假 curl + 假仓目录(清单 + 十个档位)+ 指向桩的环境变量。"""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     stub = bin_dir / "curl"
@@ -101,8 +101,11 @@ def stub_env(tmp_path):
 
 
 def _run(env, *args):
-    return subprocess.run(["bash", str(PUSH_SH), *args],
-                          env=env, capture_output=True, text=True, timeout=60)
+    r = subprocess.run(["bash", str(PUSH_SH), *args],
+                       env=env, capture_output=True, text=True, timeout=60)
+    # 每一条用例都盯住:PAT 绝不进 stdout/stderr(#449)
+    assert TOKEN not in r.stdout and TOKEN not in r.stderr, "PAT 进了输出"
+    return r
 
 
 # ---------------------------------------------------------------- --preflight
@@ -130,6 +133,22 @@ def test_preflight_network_down_says_cannot_reach(stub_env):
     assert "连不上" in r.stderr
     assert "退出码 7" in r.stderr
     assert "过期" not in r.stderr
+
+
+def test_read_only_calls_carry_timeouts_and_retries(stub_env):
+    """只读的三次调用(预检两次、查 tag 一次)自带连接超时、总超时和重试:
+    网络黑洞时不能等 curl 默认的 300 秒;短暂抖动自己重试掉,别让整轮没了。"""
+    pre = _run(stub_env["env"], "--preflight")
+    assert pre.returncode == 0, pre.stderr          # 调了 /user 和仓库这两次
+    r = _run(stub_env["env"])
+    assert r.returncode == 0, r.stderr              # 调了查 tag 这一次
+    log = stub_env["log"].read_text().splitlines()
+    for needle in ("api.github.com/user", "/releases/tags/", "api.github.com/repos/steponeerror/ip-radar-blocklist"):
+        calls = [ln for ln in log if needle in ln and "-o /dev/null" in ln]
+        assert calls, needle
+        for ln in calls:
+            for flag in ("--connect-timeout 10", "--max-time 30", "--retry 2", "--retry-delay 5", "--retry-connrefused"):
+                assert flag in ln, (needle, flag)
 
 
 def test_tag_check_network_down_reports_instead_of_silent_exit(stub_env):
@@ -178,9 +197,10 @@ def test_success_creates_and_uploads_all_ten(stub_env):
         assert any(f"name={f}" in ln for ln in uploads), f
 
 
-def test_upload_500_reports_code(stub_env):
+def test_upload_500_reports_code_and_message(stub_env):
     env = dict(stub_env["env"])
     env["STUB_MODE"] = "upload_500"
     r = _run(env)
     assert r.returncode == 1
     assert "HTTP 500" in r.stderr
+    assert "Boom" in r.stderr   # 接口 message 字段也带出来(#449 新行为)

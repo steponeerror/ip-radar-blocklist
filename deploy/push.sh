@@ -37,6 +37,10 @@ if ! TOKEN="$(read_token)"; then
 fi
 
 # gh_curl(#449):包一层 curl,输出 = curl 的输出 + 末尾一行 curl 的退出码。
+# 只读的三次调用(预检两次、查 tag)另带连接超时、总超时和重试:网络黑洞时不能等
+# curl 默认的 300 秒,短暂抖动自己重试掉,免得整轮没了。建 Release 和上传不重试
+# (重试可能把同一次发布做两遍),也不加总超时,沿用旧行为。
+
 # 传输层失败(断网、DNS、超时)时 curl 退出码非 0,输出里只有 000 或空 —— 退出码
 # 经输出带回来(函数在 $( ) 里跑,改不了外层变量),让每个调用点走「不是 2xx」的
 # 分支并打出原因。不包的话 set -e 会让脚本带着 curl 的退出码静默退出,和今天被
@@ -47,15 +51,16 @@ gh_curl() {
     printf '%s\n%s' "$out" "$rc"
 }
 
-# --preflight(#449):坏 token 1 秒内失败,不再白跑 100 分钟生成才发现。
+# --preflight(#449):坏 token 很快失败(通常 1 秒内),不再白跑 100 分钟生成才发现。
 # 放在 cd/manifest 检查之前:预检只看 token,与产物无关。
 if [[ $PREFLIGHT == 1 ]]; then
     RESP=$(gh_curl -s -o /dev/null -w '%{http_code}' \
-        -H "Authorization: Bearer $TOKEN" https://api.github.com/user)
+        -H "Authorization: Bearer $TOKEN" https://api.github.com/user \
+        --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 5 --retry-connrefused)
     CURL_RC=$(printf '%s' "$RESP" | tail -n 1)
     CODE=$(printf '%s' "$RESP" | sed '$d')
     if [[ "$CURL_RC" != 0 ]]; then
-        echo "[push.sh] 预检:连不上 GitHub API(curl 退出码 $CURL_RC)— 放弃" >&2
+        echo "[push.sh] 预检:GitHub API 调用没完成(curl 退出码 $CURL_RC;多半是连不上或传输中断)— 放弃" >&2
         exit 1
     fi
     if [[ "$CODE" != "200" ]]; then
@@ -63,11 +68,12 @@ if [[ $PREFLIGHT == 1 ]]; then
         exit 1
     fi
     RESP=$(gh_curl -s -o /dev/null -w '%{http_code}' \
-        -H "Authorization: Bearer $TOKEN" "$REPO_API")
+        -H "Authorization: Bearer $TOKEN" "$REPO_API" \
+        --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 5 --retry-connrefused)
     CURL_RC=$(printf '%s' "$RESP" | tail -n 1)
     CODE=$(printf '%s' "$RESP" | sed '$d')
     if [[ "$CURL_RC" != 0 ]]; then
-        echo "[push.sh] 预检:连不上 GitHub API(curl 退出码 $CURL_RC)— 放弃" >&2
+        echo "[push.sh] 预检:GitHub API 调用没完成(curl 退出码 $CURL_RC;多半是连不上或传输中断)— 放弃" >&2
         exit 1
     fi
     if [[ "$CODE" != "200" ]]; then
@@ -89,11 +95,12 @@ fi
 # 判断今天是否已发过(tag 已存在则跳过)
 RESP=$(gh_curl -s -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bearer $TOKEN" \
-    "$REPO_API/releases/tags/$TAG")
+    "$REPO_API/releases/tags/$TAG" \
+    --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 5 --retry-connrefused)
 CURL_RC=$(printf '%s' "$RESP" | tail -n 1)
 TAG_STATUS=$(printf '%s' "$RESP" | sed '$d')
 if [[ "$CURL_RC" != 0 ]]; then
-    echo "[push.sh] 查今天的 tag 失败:连不上 GitHub API(curl 退出码 $CURL_RC)— 放弃" >&2
+    echo "[push.sh] 查今天的 tag 失败:GitHub API 调用没完成(curl 退出码 $CURL_RC;多半是连不上或传输中断)— 放弃" >&2
     exit 1
 fi
 if [[ "$TAG_STATUS" == "200" ]]; then
@@ -146,7 +153,7 @@ RELEASE_BODY=$(printf '%s' "$RELEASE_RESP" | sed '$d' | sed '$d')
 if [[ "$HTTP_CODE" != "201" ]]; then
     MSG="$(api_message "$RELEASE_BODY")"
     if [[ "$CURL_RC" != 0 ]]; then
-        echo "[push.sh] 建 Release 失败:HTTP $HTTP_CODE — 连不上 GitHub API 或传输中断(curl 退出码 $CURL_RC)" >&2
+        echo "[push.sh] 建 Release 失败:HTTP $HTTP_CODE — GitHub API 调用没完成(curl 退出码 $CURL_RC;多半是连不上或传输中断)" >&2
     else
         echo "[push.sh] 建 Release 失败:HTTP $HTTP_CODE — ${MSG:-<接口无 message 字段>}" >&2
     fi
@@ -177,7 +184,7 @@ for f in "${FILES[@]}"; do
         echo "[push.sh] uploaded: $f ($(wc -c < "$f") bytes)"
     else
         if [[ "$CURL_RC" != 0 ]]; then
-            echo "[push.sh] FAILED to upload $f:连不上 GitHub API 或传输中断(curl 退出码 $CURL_RC)" >&2
+            echo "[push.sh] FAILED to upload $f:GitHub API 调用没完成(curl 退出码 $CURL_RC;多半是连不上或传输中断)" >&2
         else
             MSG="$(api_message "$(printf '%s' "$RESP" | sed '$d' | sed '$d')")"
             echo "[push.sh] FAILED to upload $f (HTTP $STATUS)${MSG:+ — $MSG}" >&2

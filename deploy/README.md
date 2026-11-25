@@ -19,7 +19,7 @@ systemd timer (每日 21:00 UTC,即北京 05:00,Persistent=true;一轮约 1.7–
 ```
 
 推文文案超长时的缩短顺序(#449 起):先去掉 `Data: ip-radar consensus engine`
-行(附图页脚已有同样的字),再把类名从前三名收到前两名;两样都做还超才放弃
+行(附图页脚已署名 ip-radar),再把类名从前三名缩到前两名;两样都做还超才放弃
 发推(不影响已发布的 Release)。实际用了哪一种写在 `[tweet]` 日志行里。
 
 **为什么生成与推送分离**:PAT(fine-grained,仅本仓 Contents RW)只存在于
@@ -38,7 +38,7 @@ export-spec.md §5;在 ip-radar 仓的嵌套 docs 仓里),全程只读库文件,
 ## 安装步骤(root)
 
 ```bash
-# 1. 克隆本仓(路径即 push.sh 的硬编码假定)
+# 1. 克隆本仓(push.sh 缺省就用这个路径;要放别处,设 BLOCKLIST_REPO_DIR,见下面「另」那行)
 cd /opt && git clone https://github.com/steponeerror/ip-radar-blocklist.git ip-radar-blocklist
 
 # 2. compose 配置自检(不启动任何容器;-q 静默通过即 OK)
@@ -60,6 +60,10 @@ docker volume inspect ip-lookup-tool_ipradar-data --format '{{.Mountpoint}}'
 umask 077 && install -d /root/.config
 cat > /root/.config/blocklist-push.token    # 粘贴 token,Ctrl-D
 chmod 600 /root/.config/blocklist-push.token
+#   token 怎么建:GitHub → Settings → Developer settings → Fine-grained tokens;
+#   Repository access 只选本仓;Permissions 里 Contents: Read and write
+#   (Metadata: Read 自动带)。少了写权限,建 Release 会 403。
+#   装好可以先验一下读得到读不到(不建任何东西):/opt/ip-radar-blocklist/deploy/push.sh --preflight
 
 # 6. 试跑一轮(生成 + 推送)
 docker compose -f deploy/docker-compose.exporter.yml --profile export \
@@ -67,6 +71,7 @@ docker compose -f deploy/docker-compose.exporter.yml --profile export \
 
 # 7. 安装并启用 timer
 cp deploy/ipradar-blocklist.service deploy/ipradar-blocklist.timer /etc/systemd/system/
+#(单元文件改了,要重新 cp 这一行再 daemon-reload —— /etc 里是拷贝,不是链接)
 systemctl daemon-reload
 systemctl enable --now ipradar-blocklist.timer
 systemctl list-timers ipradar-blocklist.timer   # 核对下次触发点
@@ -102,7 +107,8 @@ systemctl list-timers ipradar-blocklist.timer   # 核对下次触发点
 内烤入的 `/app/backend`(引擎 compose 从仓根 context 构建,baked 即权威版本,
 不再从宿主 bind 覆盖 —— 与数据卷同理,消除路径猜测)。
 
-另:推送 token 可用 env `BLOCKLIST_PUSH_TOKEN` 临时覆盖 token 文件。
+另:推送 token 可用 env `BLOCKLIST_PUSH_TOKEN` 临时覆盖 token 文件;仓目录可用 env
+`BLOCKLIST_REPO_DIR` 覆盖(缺省 `/opt/ip-radar-blocklist`;改单元文件时给 Environment= 即可)。
 
 ## 运维读 manifest.json
 
@@ -125,7 +131,7 @@ scan 阶段逐批采样与 geo 阶段采样两段的匿名内存最大值)/ `ela
 `drift_examples` 里的是按规则跳过的地址;`mismatch_examples` 里停下来
 的,不论涉不涉及扫描之后被重建的源,都是没被重建的那部分对不上,按报错
 里的值找引擎侧)、RSS 超限(看 `error` 里的阶段)、
-token 无效或过期(现在由 ExecStartPre 预检 1 秒内拦下,见下面的
+token 无效或过期(现在由 ExecStartPre 预检拦下,见下面的
 「发布侧失败模式」)。
 
 **扫描期间有源被重建(每轮都可能有,不是故障)**:生产上扫描要跑一个多小时,
@@ -150,14 +156,13 @@ Q6 原来写的是「纪元变了就重跑」,已被这条规则取代(2026-11-2
 
 | 失败 | 何时暴露 | journal 里看什么 |
 |---|---|---|
-| token 读不到 / 无效或过期 / 访问不到仓库 | `ExecStartPre` 预检,**1 秒内**失败,不进生成(不白跑 100 分钟) | `[push.sh] 预检:…(HTTP <码>)` |
+| token 读不到 / 无效或过期 / 访问不到仓库 | `ExecStartPre` 预检,**通常 1 秒内**失败,不进生成(不白跑 100 分钟) | 读不到:`[push.sh] 推送 token 读不到(…)— 放弃`;其余:`[push.sh] 预检:…(HTTP <码>)` |
 | token 没有 Contents 写权限(建 Release 被拒 403) | 生成跑完后建 Release 那步失败 —— 预检只验读,验不出这个 | `[push.sh] 建 Release 失败:HTTP 403 — <接口 message>` + 「Contents: Read and write」提示 |
-| 连不上 GitHub API(断网、DNS、超时) | 预检 1 秒内失败;或查 tag、建 Release、上传档位时失败 | `[push.sh] …连不上 GitHub API(curl 退出码 <n>)` |
+| 连不上 GitHub API(断网、DNS、超时) | 预检自带重试两次,网络不通时最多一两分钟失败,**这一轮不生成、不发**;网络恢复后手动 `systemctl start ipradar-blocklist.service` 补跑。也可能在查 tag、建 Release、上传档位时失败(后两处不重试、不加超时,沿用旧行为) | `[push.sh] …GitHub API 调用没完成(curl 退出码 <n>;多半是连不上或传输中断)` |
 
 
-前两种的修复都是换/补 token(见安装步骤第 5 步:Permissions 里
-**Contents: Read and write**,Metadata: Read 自动带)。连不上是网络问题,等下一轮,或手动
-`systemctl start ipradar-blocklist.service`。
+前两种的修复都是换/补 token(建法见安装步骤第 5 步:只选本仓,Permissions 里
+**Contents: Read and write**,Metadata: Read 自动带)。
 
 ## 残余风险(如实记录)
 
