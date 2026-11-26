@@ -12,15 +12,15 @@ systemd timer (每日 21:00 UTC,即北京 05:00,Persistent=true;一轮约 1.7–
        │                  (容器: 挂引擎 LMDB 只读卷按键序扫描
        │                   scan → geo → emit(#444),产物写 /repo =
        │                   /opt/ip-radar-blocklist)
-       ├─ ExecStartPost: deploy/push.sh
-       │                  (宿主机: 调 GitHub Release 接口建当天的 Release 并上传档位;
-       │                   说明里带本轮的核对读数)
-       └─ ExecStartPost: deploy/tweet.py(Release 成功后发推;当天发过则跳过)
+       └─ ExecStartPost: deploy/push.sh
+                          (宿主机: 调 GitHub Release 接口建当天的 Release 并上传档位;
+                           说明里带本轮的核对读数)
 ```
 
-推文文案超长时的缩短顺序(#449 起):先去掉 `Data: ip-radar consensus engine`
-行(附图页脚已署名 ip-radar),再把类名从前三名缩到前两名;两样都做还超才放弃
-发推(不影响已发布的 Release)。实际用了哪一种写在 `[tweet]` 日志行里。
+**发推这一步 2026-11-26 起取消**(所有者决定):原先 Release 发出后由
+`deploy/tweet.py` 自动发一条推文;后来 X 的接口额度用尽(402 credits depleted),
+所有者决定以后不再发推。`tweet.py` 与其测试已删,服务器上的 X 凭据文件
+`/root/.config/ipradar-tweet.json` 不再被任何东西读取。
 
 **为什么生成与推送分离**:PAT(fine-grained,仅本仓 Contents RW)只存在于
 宿主机 `/root/.config/blocklist-push.token`(0600)。容器只拿只读数据卷和
