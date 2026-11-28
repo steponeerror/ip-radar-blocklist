@@ -1,0 +1,15 @@
+# ipradar-blocklist 发布日志轮转(#461,2026-11-28)
+# push.sh 的输出(stdout+stderr)追加到 /var/log/ipradar-blocklist.log;
+# 这条规则给它总量上限:单文件 10M 就轮,最多留 8 份压缩旧档
+# (上限约 80M,964Mi/40G 小机可接受)。copytruncate:push.sh 用
+# `exec > >(tee -a …)` 持着文件句柄,不 truncate 会一直写到轮转后的旧档。
+# 安装:cp deploy/ipradar-blocklist.logrotate /etc/logrotate.d/ipradar-blocklist
+/var/log/ipradar-blocklist.log {
+    size 10M
+    maxsize 10M
+    rotate 8
+    compress
+    copytruncate
+    missingok
+    notifempty
+}

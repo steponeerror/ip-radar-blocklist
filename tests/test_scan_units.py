@@ -1,10 +1,11 @@
 """scan_units 单元测试(#444 B 步)—— 三块,期望值原样搬自被删模块:
 
-* extract_fields(原 consensus_client._extract_fields):共识列提取规则
-  一字不改 —— verdict=threat.verdict;只有 malicious 行填数值和列表
-  (classes/sources 取「detected 且 malicious」分类的 type 与 source
-  去重排序、分号连接;confidence 取这些分类置信度的最大值,不是
-  threat.confidence);asn/country 取 merged 的 value,缺失留空。
+* extract_fields(#521 改后):verdict=threat.verdict;只有 malicious 行填
+  数值和列表(classes/sources 取「detected 且 malicious」分类的 type 与
+  source 去重排序、分号连接 —— 展示列照旧列全;confidence =
+  threat.confidence 融合值;source_count = threat.first_hand_source_count
+  引擎给的第一手数 —— 两者都与网页同一个数,不本地重算;字段缺失响亮
+  失败);asn/country 取 merged 的 value,缺失留空。
 * 匿名内存红线(T7 原样):自检口径 = smaps_rollup `Anonymous:` 行
   (路径常量即注入接缝),解析失败回退 ru_maxrss 并告警一次;
   scan_units 每批提交后量一次,超 max_rss_mb 抛 MemoryBudgetExceeded。
@@ -46,14 +47,20 @@ def _cls(type_, verdict, detected, sources, cls_conf=80):
                          "authoritative": False} for s in sources]}
 
 
+_MISSING = object()   # 哨兵:threat 里不写 first_hand_source_count(旧引擎载荷)
+
+
 def _row(ip, verdict, confidence, classifications=None,
-         is_reserved=False, asn="64512", country="US"):
+         is_reserved=False, asn="64512", country="US", first_hand=_MISSING):
+    threat = {"verdict": verdict, "confidence": confidence,
+              "types": [], "is_cdn": False}
+    if first_hand is not _MISSING:
+        threat["first_hand_source_count"] = first_hand
     return {"ip": ip, "country": _merge(country), "city": _merge(None),
             "city_zh": None, "location": None, "asn": _merge(asn),
             "as_name": _merge("TEST AS"), "ip_range": _merge(None),
             "is_isp": False,
-            "threat": {"verdict": verdict, "confidence": confidence,
-                       "types": [], "is_cdn": False},
+            "threat": threat,
             "classifications": classifications or {},
             "attributes": {}, "is_reserved": is_reserved}
 
@@ -62,7 +69,10 @@ def _row(ip, verdict, confidence, classifications=None,
 
 def test_extract_fields_malicious_multi_classification_dedup():
     """跨 classification 去重口径:两恶意 detection 共享 dataplane;
-    suspicious detection 与 archive 章(detected False)都不进计数。"""
+    suspicious detection 与 archive 章(detected False)都不进 classes/
+    sources 展示列。source_count 自 #521 起读引擎字段,与展示列脱钩:
+    first_hand=2 是引擎手填(夹具里没有 firehol 等真源;本条验证的是
+    「读引擎字段、不本地重数」,不是算第一手)。"""
     row = _row(
         "203.0.113.7", "malicious", 80,
         classifications={
@@ -72,15 +82,17 @@ def test_extract_fields_malicious_multi_classification_dedup():
                          ["dataplane", "blocklistde"]),
             "c2": _cls("c2", "suspicious", True, ["shodan"]),
             "archive": _cls("archive", "malicious", False, ["misp_archive"]),
-        })
+        },
+        first_hand=2)
     assert su.extract_fields(row) == (
         "malicious", 80, "scanner;spam",
-        "blocklistde;dataplane;turris_greylist", 3, "64512", "US")
+        "blocklistde;dataplane;turris_greylist", 2, "64512", "US")
 
 
-def test_extract_fields_confidence_is_max_malicious_classification():
-    """confidence = 恶意分类置信度的最大值,不是 threat.confidence
-    (旧注:threat.confidence 多分类时按字典序碰运气,非确定 —— 不用)。"""
+def test_extract_fields_confidence_is_fused_threat_value():
+    """confidence = threat.confidence 融合值(#521 出海数字统一:与网页
+    同一个数)。组级 max 是 80,融合值 87 —— 多类别佐证计入后更高。
+    变异:改回「恶意分类组最大值」→ 本用例红。"""
     row = _row(
         "203.0.113.7", "malicious", 87,
         classifications={
@@ -88,8 +100,35 @@ def test_extract_fields_confidence_is_max_malicious_classification():
                             cls_conf=80),
             "spam": _cls("spam", "malicious", True, ["blocklistde"],
                          cls_conf=60),
-        })
-    assert su.extract_fields(row)[1] == 80
+        },
+        first_hand=2)
+    assert su.extract_fields(row)[1] == 87
+
+
+def test_extract_fields_source_count_is_engine_first_hand():
+    """source_count = threat.first_hand_source_count(#521):引擎给的第一
+    手指控源数,不在这里重数。展示列并集 3 源,引擎说第一手 2 → 填 2。
+    变异:改回 len(src_names) → 本用例红。"""
+    row = _row(
+        "203.0.113.7", "malicious", 90,
+        classifications={
+            "scanner": _cls("scanner", "malicious", True,
+                            ["dataplane", "turris_greylist"]),
+            "spam": _cls("spam", "malicious", True,
+                         ["dataplane", "blocklistde"]),
+        },
+        first_hand=2)
+    assert su.extract_fields(row)[4] == 2
+
+
+def test_extract_fields_missing_first_hand_raises():
+    """引擎镜像早于 #521(threat 无 first_hand_source_count)→ 响亮失败
+    提示重建镜像,不猜 0(与 require_scan_engine 同哲学)。"""
+    row = _row("203.0.113.7", "malicious", 90,
+               classifications={"scanner": _cls("scanner", "malicious",
+                                                True, ["dataplane"])})
+    with pytest.raises(su.ScanUnitsError, match="first_hand_source_count"):
+        su.extract_fields(row)
 
 
 def test_extract_fields_missing_asn_value_is_empty_string():
@@ -98,7 +137,7 @@ def test_extract_fields_missing_asn_value_is_empty_string():
         "203.0.113.0", "malicious", 60,
         classifications={"scanner": _cls("scanner", "malicious", True,
                                          ["dataplane"], cls_conf=60)},
-        asn=None, country="DE")
+        asn=None, country="DE", first_hand=1)
     assert su.extract_fields(row) == (
         "malicious", 60, "scanner", "dataplane", 1, "", "DE")
 

@@ -45,10 +45,15 @@ cd /opt && git clone https://github.com/steponeerror/ip-radar-blocklist.git ip-r
 cd /opt/ip-radar-blocklist
 docker compose -f deploy/docker-compose.exporter.yml --profile export config -q
 
-# 3. 核对引擎镜像含按键序扫描器(#444 A 步);没有就先部署引擎、重建镜像
+# 3. 核对引擎镜像含按键序扫描器(#444)与出海源数字段(#521);任一没过,先
+#    部署引擎、重建镜像(部署顺序:引擎先、导出器后 —— 引擎镜像烤的是引擎仓代码)
 docker run --rm --network none -w /app/backend --entrypoint python ipradar:latest \
   -c "import ipdb._scan; print('ok')"
-#   (镜像的工作目录是 /app,引擎代码在 /app/backend,所以要 -w;导出器自己会把这个路径加进 sys.path)
+docker run --rm --network none -w /app/backend --entrypoint python ipradar:latest \
+  -c "from ipdb._api_models import ThreatSummaryOut; assert 'first_hand_source_count' in ThreatSummaryOut.model_fields; print('ok')"
+#   (镜像的工作目录是 /app,引擎代码在 /app/backend,所以要 -w;导出器自己会把这个路径加进 sys.path;
+#    第二条不过 = 镜像早于 #521,scan 阶段 ScanUnitsError 报 threat 缺 confidence /
+#    first_hand_source_count 退出 1,同样先重建镜像再跑)
 
 # 4. 核对引擎数据卷存在且非空(默认假定 ip-lookup-tool_ipradar-data)
 docker volume inspect ip-lookup-tool_ipradar-data --format '{{.Mountpoint}}'
@@ -126,7 +131,9 @@ scan 阶段逐批采样与 geo 阶段采样两段的匿名内存最大值)/ `ela
 引擎数据卷缺失/为空(scan 阶段报「扫描出 0 个单元,不发空档位」——
 空档位会被发成 Release,所以零单元直接停;看 `scan_stats.units_total`,
 生产约 553 万,为 0 就是卷没挂对,修好卷再重跑)、引擎镜像太旧
-(scan 阶段报「引擎镜像早于 #444」—— 先重建引擎镜像再跑)、geo 阶段
+(scan 阶段报「引擎镜像早于 #444」—— 先重建引擎镜像再跑)、引擎镜像早于
+#521(scan 阶段 ScanUnitsError 报 threat 缺 confidence / first_hand_source_count
+—— 同样先重建引擎镜像再跑,装步骤第 3 步有核对命令)、geo 阶段
 判定对不上(「geo 阶段判定核对失败」带例子的 IP、列和两边的值;
 `drift_examples` 里的是按规则跳过的地址;`mismatch_examples` 里停下来
 的,不论涉不涉及扫描之后被重建的源,都是没被重建的那部分对不上,按报错
@@ -150,7 +157,45 @@ Q6 原来写的是「纪元变了就重跑」,已被这条规则取代(2026-11-2
 停更了没人知道是真实发生过的事:2026-11-16、11-17 两晚轮次被 4h 上限杀掉,
 断更两天后才发现;之后定时器有意停到 #444 做完(11-18 到 11-25)。
 每日 Release 说明里的核对读数、`manifest.json` 的 `generated_at` 是判断导出
-是否活着的两个地方(自动的新鲜度检查见 ip-radar 仓 #448)。
+是否活着的两个地方(自动的新鲜度检查见下一节)。
+
+## 断更告警(#448)与发布日志(#461)
+
+**断更告警**(`deploy/check_freshness.py`):manifest.json 的
+`generated_at` 超过 36 小时(或文件缺 / JSON 坏 / 带 `error` 键 —— 失败轮
+的时间戳是失败当时的,只看时间会永远「新鲜」)→ 发一条 apprise 告警,
+正文带日志尾 5 行。装法(root):
+
+```bash
+# 1. 宿主机装 apprise(Debian bookworm 起 pip 装进系统环境会被拦,可能要
+#    加 --break-system-packages;apt install python3-apprise 也行,二选一)
+pip install apprise        # 或:pip install --break-system-packages apprise
+
+# 2. 放告警目标(可省:文件不存在时单元照跑,只是发不出告警)
+install -m 600 /dev/null /etc/ipradar-blocklist-alert.env
+cat > /etc/ipradar-blocklist-alert.env   # 写一行:IP_RADAR_ALERT_URLS=<apprise URL>(与引擎告警同一个)
+
+# 3. 装单元并启用(每日 23:30 UTC 一发;Persistent=true 错过会补跑)
+cp deploy/ipradar-blocklist-freshness.service deploy/ipradar-blocklist-freshness.timer /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now ipradar-blocklist-freshness.timer
+systemctl list-timers ipradar-blocklist-freshness.timer   # 核对下次触发点
+systemctl start ipradar-blocklist-freshness.service       # 手工跑一次,应看到「未过期」读数
+```
+
+36 小时阈值的取舍:导出轮 21:00 UTC 起跑、约 1.7–2 小时(上限 4h),
+23:30 的检查点在预计完成之后 —— 缺一轮(挂了但 manifest 时间戳还是昨天)
+不告,缺两轮才告;从首次失败到收到告警最长约 26.5 小时。想「缺一轮就
+告」可把 `IP_RADAR_FRESHNESS_MAX_AGE_H` 调到 23 以下(alert env 文件里
+加一行),但 4 小时长尾轮会误报,自己权衡。每天最多一条:state 文件
+(/var/lib/ipradar-blocklist/freshness-state.json)记上次告警的 UTC 日期;
+推送失败不写 state,下一轮重试。
+
+**发布日志**(#461):push.sh 的 stdout/stderr 各自 tee 进
+`/var/log/ipradar-blocklist.log`(journal 两路照收);装轮转:
+`cp deploy/ipradar-blocklist.logrotate /etc/logrotate.d/ipradar-blocklist`
+(单文件 10M、留 8 份压缩,总量约 80M 封顶)。部署后手工看一眼日志末行
+是不是推送结束行 —— tee 是进程替换,push.sh 已用 `trap 'sleep 1' EXIT`
+缓冲,但真实 systemd 行为只有部署机上能验,测试面验不了。
 
 ## 发布侧失败模式(token,#449)
 

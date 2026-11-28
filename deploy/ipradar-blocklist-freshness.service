@@ -1,0 +1,22 @@
+# ip-radar 黑名单断更告警(#448)systemd 单元。
+# 安装:cp deploy/ipradar-blocklist-freshness.{service,timer} /etc/systemd/system/
+#       systemctl daemon-reload && systemctl enable --now ipradar-blocklist-freshness.timer
+# 手工跑一次(看到「未过期」读数):systemctl start ipradar-blocklist-freshness.service
+# 告警 webhook:宿主机 /etc/ipradar-blocklist-alert.env 里一行
+#   IP_RADAR_ALERT_URLS=<与引擎 docker-compose.override.yml 同一个 URL>
+# (EnvironmentFile 带 - 前缀:文件不存在单元照跑,只是发不出告警,journal 里有提示。)
+
+[Unit]
+Description=ip-radar blocklist freshness alert (manifest.json older than 36h -> webhook)
+# Wants+After(评审 L):Persistent 开机补跑时先把网络拉起来,推送不白失败一轮
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/ip-radar-blocklist
+EnvironmentFile=-/etc/ipradar-blocklist-alert.env
+# 只查、只告警:不自动重跑导出(#448 验收口径)。失败退出码留给
+# 「该告而没告成」,journal 里看得见。
+ExecStart=/opt/ip-radar-blocklist/deploy/check_freshness.py

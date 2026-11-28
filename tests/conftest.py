@@ -25,7 +25,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))      # scripts/ as namespace pkg portion
 
-ENGINE_BACKEND = Path("/home/huxiao/dev/pi-ip-lookup-tool/backend")
+# 引擎 backend 路径:默认主检出;可用 IP_RADAR_ENGINE_BACKEND 指到别的
+# 检出/工作树(#521 实现期用 .worktrees/arch4-521,让集成测试跑在带
+# first_hand_source_count 的新字段上)。
+ENGINE_BACKEND = Path(os.environ.get(
+    "IP_RADAR_ENGINE_BACKEND", "/home/huxiao/dev/pi-ip-lookup-tool/backend"))
 ASOF = 1765000000.0                        # 与本机整轮试跑同一判定时刻
 
 # 全 12 列建表(CLI 先建 5 列再 ALTER 7 列共识列之后的形态;列序同
@@ -51,7 +55,9 @@ def create_units(db):
 
 # dataplane 原始行(ASN|ASname|IP|lastseen|category;single-witness 判定
 # 只依赖类别与可靠度,地址取真实全球段):
-#   1.2.3.5  —— dataplane + turris 单地址 + danmeuk_tor 资产证人 → sc=2
+#   1.2.3.5  —— dataplane + turris 单地址 + danmeuk_tor 指控证人 → sc=3(#521 起
+#              source_count = 引擎给的 first_hand_source_count,detail 级指控
+#              证人含 suspicious 的 danmeuk_tor)
 #   1.2.3.7  —— 仅 dataplane → sc=1
 #   5.6.7.9  —— dataplane 单地址,落在 turris 5.6.7.0/24 网段内 → sc=2
 #   10.99.99.1 —— 保留地址:单元产出但判定短路成 reserved,不进档
@@ -69,7 +75,8 @@ TURRIS_ROWS = [
     "5.6.7.0/24,smtp",             # v4 网段单元
     "2a00:1450:4001::/48,telnet",  # v6 网段单元(全球可路由段)
 ]
-# danmeuk_tor(资产类,verdict=suspicious 证人;良性/资产断言不进共识计数):
+# danmeuk_tor(资产类,verdict=suspicious 证人;#521 起它是指控证人:
+# suspicious 在指控章 _ACCUSING 里,进 first_hand_source_count):
 DANMEUK_ROWS = [
     "1.2.3.5",     # 并入多源同址单元
     "1.2.3.99",    # 只有资产类记录 → 不产单元

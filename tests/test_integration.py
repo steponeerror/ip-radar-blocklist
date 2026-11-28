@@ -34,17 +34,21 @@ DEFAULT_TIERS = (100, 500, 1000, 5000, 10000)
 EXPECTED_ARTIFACTS = {f"top_{n}.{ext}" for n in DEFAULT_TIERS
                       for ext in ("txt", "csv")} | {"manifest.json"}
 
-# 排序全链端到端期望:sc=2 组内(5.6.7.9 与 1.2.3.5)confidence 并列,
-# last_seen DESC 定序;sc=1 组(1.2.3.7 与 2606:4700::1)同理
-EXPECTED_ORDER = ["5.6.7.9", "1.2.3.5", "1.2.3.7", "2606:4700::1"]
+# 排序全链端到端期望(#521 后):source_count 第一键 = 引擎给的第一手
+# 源数。1.2.3.5 三个第一手指控源(dataplane、turris、danmeuk_tor ——
+# 资产类 suspicious 也在指控章)= sc 3,排最前;5.6.7.9 sc 2;
+# sc=1 组(1.2.3.7 与 2606:4700::1)confidence 并列,last_seen DESC 定序
+EXPECTED_ORDER = ["1.2.3.5", "5.6.7.9", "1.2.3.7", "2606:4700::1"]
 
 # 字节级钉死排序全链 + geo 补查回写(asn 胜者来自 dataplane;country 无
-# 地理源 → 引擎兜底值 N/A)+ 提取规则(只有 malicious 分类计数)
+# 地理源 → 引擎兜底值 N/A)+ #521 提取口径:confidence = 融合值
+# (1.2.3.5 三证人池化 95 > 旧组内 max 70;5.6.7.9 池化 78),
+# source_count = 第一手源数(不再数转载/并集)
 EXPECTED_CSV_ROWS = [
+    "1.2.3.5,1513399,N/A,brute-force;scanner,95,3,"
+    "2026-10-01T00:00:00Z,2026-10-01T00:00:00Z",
     "5.6.7.9,1513399,N/A,scanner,78,2,"
     "2026-10-02T00:00:00Z,2026-10-02T00:00:00Z",
-    "1.2.3.5,1513399,N/A,brute-force;scanner,70,2,"
-    "2026-10-01T00:00:00Z,2026-10-01T00:00:00Z",
     "1.2.3.7,1513399,N/A,brute-force,70,1,"
     "2026-10-05T00:00:00Z,2026-10-05T00:00:00Z",
     "2606:4700::1,64512,N/A,brute-force,70,1,"
@@ -490,19 +494,26 @@ def test_geo_skip_requires_the_unchanged_sources_to_agree(engine_env):
 def test_geo_mismatch_writes_error_manifest_nothing_published(
         engine_env, tmp_path, monkeypatch, capsys):
     """geo 阶段判定对不上 → error manifest、退出 1、不发布任何档位文件。
-    lookup 打桩偏移恶意分类置信度(只影响 geo 侧;扫描侧诚实入库,
-    两边必不一致)。"""
+    lookup 打桩偏移顶层融合置信度(只影响 geo 侧;扫描侧诚实入库,
+    两边必不一致)。#521 后 confidence 列 = threat.confidence,打桩点
+    随之从分类组级移到 to_dict 产物的 threat 上。"""
     out_dir = tmp_path / "out"
     import ipdb
     real_lookup = ipdb.lookup
 
+    class _Skewed:
+        def __init__(self, d):
+            self._d = d
+
+        def to_dict(self):
+            return self._d
+
     def skewed(ip, *args, **kwargs):
-        result = real_lookup(ip, *args, **kwargs)
-        for cls in result.classifications.values():
-            if cls.detected and cls.verdict == "malicious":
-                cls.confidence = cls.confidence + 7
-                break
-        return result
+        d = real_lookup(ip, *args, **kwargs).to_dict()
+        t = d.get("threat") or {}
+        if t.get("verdict") == "malicious":
+            t["confidence"] = t["confidence"] + 7
+        return _Skewed(d)
 
     monkeypatch.setattr(ipdb, "lookup", skewed)
 

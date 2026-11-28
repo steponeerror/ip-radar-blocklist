@@ -37,10 +37,12 @@ CSV_HEADER = ("ip", "asn", "country", "classes", "confidence",
 # 共用这份常量 —— 两处条数漂移 = 补查集合和档位集合不一致。
 TIERS = (100, 500, 1000, 5000, 10000)
 
-# 单条排序键链(Q2-B):source_count DESC → confidence DESC →
-# last_seen NULLS LAST(SQLite 无 NULLS LAST 关键字,`last_seen IS NULL`
-# 得 0/1,ASC 即非 NULL 在前)→ last_seen DESC 最新优先 → ip ASC 终键保
-# 跨轮确定性。档位 SQL 与 geo 补查选集(#444)共用这一份常量,不抄两份。
+# 单条排序键链(Q2-B,#521 起第一键 = 第一手源数):source_count DESC →
+# confidence DESC → last_seen NULLS LAST(SQLite 无 NULLS LAST 关键字,
+# `last_seen IS NULL` 得 0/1,ASC 即非 NULL 在前)→ last_seen DESC 最新
+# 优先 → ip ASC 终键保跨轮确定性。source_count 自 #521 起是引擎给的
+# 第一手指控源数(去派生聚合器后去重,与网页同一个数),不再数转载。
+# 档位 SQL 与 geo 补查选集(#444)共用这一份常量,不抄两份。
 TIER_ORDER_BY = ("source_count DESC, confidence DESC,"
                  " last_seen IS NULL ASC, last_seen DESC, ip ASC")
 

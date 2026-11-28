@@ -5,6 +5,27 @@ set -euo pipefail
 # PAT 绝不出现在日志(不 set -x;若外部 wrap 了 set -x 也不继承)
 if [[ $- == *x* ]]; then set +x; echo "[push.sh] set -x 已关闭(PAT 安全)" >&2; fi
 
+# 发布日志落盘(#461,2026-11-28):stdout 与 stderr 同时追加到
+# /var/log/ipradar-blocklist.log(journald 在这台机器只留得下一个半小时,
+# 2026-11-26 教训:push.sh 的报错行随日志轮转消失,只能事后复现)。用
+# exec 重定向不改退出码;日志文件不可写(非 root、磁盘满)时告警一行后
+# 只走 stdout/stderr,绝不因日志挡发布。轮转规则见 deploy/ 下
+# ipradar-blocklist.logrotate(总量上限 8×10MB),安装说明 deploy/README.md。
+LOG_FILE="${BLOCKLIST_LOG:-/var/log/ipradar-blocklist.log}"
+if touch "$LOG_FILE" 2>/dev/null; then
+    # stdout 与 stderr 各自 tee 进同一份文件(各自保流:stderr 还是 stderr,
+    # systemd journal 两路照收;测试面按 stdout/stderr 断言的旧用例不破)。
+    exec > >(tee -a "$LOG_FILE")
+    exec 2> >(tee -a "$LOG_FILE" >&2)
+    # systemd 下 bash 不等进程替换结束就退出,主进程一退 unit 清 cgroup
+    # 残余(两个 tee),最后几行——恰是失败时的报错行——可能丢。等一秒
+    # 让 tee 把管道收完(评审 F 选的最小改法;部署后手工看一眼日志末行
+    # 是不是结束行,见 PR 正文)。
+    trap 'sleep 1' EXIT
+else
+    echo "[push.sh] 日志文件 $LOG_FILE 不可写,输出只进 stdout/stderr(#461)" >&2
+fi
+
 REPO_DIR="${BLOCKLIST_REPO_DIR:-/opt/ip-radar-blocklist}"
 REPO_API="https://api.github.com/repos/steponeerror/ip-radar-blocklist"
 DATE="${RELEASE_DATE:-$(date -u +%Y-%m-%d)}"

@@ -5,8 +5,11 @@
 调引擎的按键序扫描器(backend/ipdb/_scan.py 的 open_unit_scanner,#444
 A 步)把各源库按键序读一遍、归并出每个单元的证据、用与查询接口同一套
 融合代码算判定,逐单元写 sqlite units 表。判定五列(verdict、confidence、
-classes、sources、source_count)由扫描结果按原 _extract_fields 规则填;
-asn、country 扫描阶段留 NULL(扫描按规格不读地理库),geo 阶段只给进榜
+classes、sources、source_count)由扫描结果填;confidence 与 source_count
+读引擎融合层给的数(#521 出海数字统一:threat.confidence 与
+threat.first_hand_source_count,与网页同一个数),classes/sources 照旧
+取恶意分类组的并集。
+ asn、country 扫描阶段留 NULL(扫描按规格不读地理库),geo 阶段只给进榜
 IP 补查回写(见 generate_blocklist.py)。
 
 内存红线不变(T7 口径):批量 executemany + commit,每批之后量一次匿名
@@ -69,8 +72,9 @@ class MemoryBudgetExceeded(RuntimeError):
 
 
 class ScanUnitsError(RuntimeError):
-    """scan 阶段永久性失败:引擎镜像太旧(require_scan_engine)、
-    单元行缺 verdict(extract_fields)。"""
+    """scan 阶段永久性失败:引擎镜像太旧(require_scan_engine)、单元行缺
+    verdict,或缺 confidence / first_hand_source_count(引擎镜像早于
+    #521,先重建镜像再跑)。"""
 
 
 def _current_rss_mb() -> float:
@@ -139,13 +143,18 @@ def _merged_str(row: dict, field: str) -> str:
 
 def extract_fields(row: dict) -> tuple:
     """lookup result → (verdict, confidence, classes, sources, source_count,
-    asn, country),按 Global Constraints 入选口径(原 consensus_client
-    _extract_fields,规则一字不改):
+    asn, country),按 Global Constraints 入选口径(#521 改后):
 
     - verdict = threat.verdict(全行存储,含 suspicious/benign/reserved);
-    - 仅 malicious 行计数值字段:source_count/classes/sources 取「全部
-      detected ∧ verdict=="malicious" 的 classification」里 distinct 源名
-      与 type 并集;confidence = max malicious classification confidence;
+    - 仅 malicious 行计数值字段:classes/sources 取「全部 detected ∧
+      verdict=="malicious" 的 classification」里 distinct 源名与 type 并集
+      (展示列,照旧列全);confidence = threat.confidence(融合后验,
+      #521 出海数字统一 2026-11-28:与网页同一个数 —— 旧口径「恶意分类组
+      级 max」多类别佐证不计入,数字系统性偏低;旧注释「threat.confidence
+      按字典序碰运气,非确定性」已过时,_logodds.accuser_pool 排序已固定
+      并有测试钉住);source_count = threat.first_hand_source_count(引擎
+      给的第一手指控源数,去 DERIVED_SOURCES 后去重 —— 与网页同一个数,
+      不在这里再数一份);
     - 非 malicious 行数值/列表字段 NULL(suspicious 不入选,仅留 verdict)。
     """
     threat = row.get("threat") or {}
@@ -166,16 +175,20 @@ def extract_fields(row: dict) -> tuple:
             src_names.update(
                 s.get("source") for s in (cls.get("sources") or [])
                 if s.get("source"))
-    # confidence: 所有恶意分类中的最大值(与平台 UI 一致;threat.confidence
-    # 在多分类同 verdict 时按字典序碰运气,非确定性——不用)
-    max_conf = max(
-        (cls.get("confidence") for cls in (row.get("classifications") or {}).values()
-         if cls.get("detected") and cls.get("verdict") == "malicious"
-         and isinstance(cls.get("confidence"), (int, float))),
-        default=None)
-    return (verdict, max_conf,
+    # confidence / source_count(#521):与网页同一个数 —— 引擎融合层
+    # (backend/ipdb/_types.py threat_summary)算好直接读,不本地重算。
+    # 字段缺失(引擎镜像早于 #521)按破损响亮失败,不猜 0。
+    confidence = threat.get("confidence")
+    source_count = threat.get("first_hand_source_count")
+    if not isinstance(confidence, (int, float)) or \
+            not isinstance(source_count, int):
+        raise ScanUnitsError(
+            f"row {row.get('ip')!r}: threat missing confidence or "
+            "first_hand_source_count (engine image predates #521? "
+            "rebuild the engine image first)")
+    return (verdict, confidence,
             ";".join(sorted(classes)), ";".join(sorted(src_names)),
-            len(src_names), _merged_str(row, "asn"), _merged_str(row, "country"))
+            source_count, _merged_str(row, "asn"), _merged_str(row, "country"))
 
 
 def scan_units(data_dir, db: sqlite3.Connection, *, asof,
