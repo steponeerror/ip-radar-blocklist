@@ -8,6 +8,8 @@
 
 [Unit]
 Description=ip-radar blocklist freshness alert (manifest.json older than 36h -> webhook)
+# Wants+After(评审 L):Persistent 开机补跑时先把网络拉起来,推送不白失败一轮
+Wants=network-online.target
 After=network-online.target
 
 [Service]

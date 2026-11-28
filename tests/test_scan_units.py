@@ -71,7 +71,8 @@ def test_extract_fields_malicious_multi_classification_dedup():
     """跨 classification 去重口径:两恶意 detection 共享 dataplane;
     suspicious detection 与 archive 章(detected False)都不进 classes/
     sources 展示列。source_count 自 #521 起读引擎字段,与展示列脱钩:
-    三个并集源里第一手只有 2(firehol 是转载,不重复点票)。"""
+    first_hand=2 是引擎手填(夹具里没有 firehol 等真源;本条验证的是
+    「读引擎字段、不本地重数」,不是算第一手)。"""
     row = _row(
         "203.0.113.7", "malicious", 80,
         classifications={

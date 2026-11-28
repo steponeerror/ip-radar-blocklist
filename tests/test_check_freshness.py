@@ -108,6 +108,23 @@ def test_unparseable_manifest_treated_stale(env):
     assert "解析不了" in env["calls"][1][1]
 
 
+def test_error_manifest_alerts_even_when_fresh(env):
+    """评审 A(必须改):失败轮的清单被 write_error_manifest 用失败当时
+    的时间覆写,只看 generated_at 会永远「新鲜」→ 告警永不发。error 键
+    非空 = 上一轮失败,按过期处理,正文带原因(含 ScanUnitsError);
+    同日不重复。"""
+    _manifest(env["manifest"], "2026-11-28T23:00:00+00:00")   # 半小时前,足够「新鲜」
+    payload = json.loads(env["manifest"].read_text(encoding="utf-8"))
+    payload["error"] = "[scan] ScanUnitsError: row '1.2.3.5': threat missing confidence"
+    env["manifest"].write_text(json.dumps(payload), encoding="utf-8")
+    assert _run(env) == 0
+    assert len(env["calls"]) == 1
+    assert "ScanUnitsError" in env["calls"][0][1]
+    assert "上一轮失败" in env["calls"][0][1]
+    assert _run(env) == 0
+    assert len(env["calls"]) == 1
+
+
 def test_push_failure_does_not_write_state_and_fails(env, monkeypatch):
     """推送失败 → 退出码 1、state 不写(下次运行重试,不当成已告警)。"""
     _manifest(env["manifest"], "2026-11-27T03:00:00+00:00")

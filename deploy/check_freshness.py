@@ -48,15 +48,24 @@ now_fn = lambda: datetime.now(timezone.utc)   # noqa: E731
 
 def _manifest_age_h(path: Path, now: datetime) -> tuple[float | None, str]:
     """(generated_at 年龄小时, 读数说明)。任何读不出/解析不了 → (None, 原因),
-    调方把 None 当过期。"""
+    调方把 None 当过期。
+
+    评审返工(#521 评审 A,必须改):失败轮盲区 —— 管线失败时
+    write_error_manifest 用失败当时的时间覆写 manifest.json,只看
+    generated_at 会永远「新鲜」。error 键非空 = 上一轮失败,按过期处理
+    并带原因(str(error)[:200],防超长刷屏)。"""
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError as e:
         return None, f"manifest 读不到({e.strerror or e})"
     try:
-        generated_at = json.loads(raw).get("generated_at")
+        doc = json.loads(raw)
     except (json.JSONDecodeError, AttributeError):
         return None, "manifest JSON 解析不了"
+    error = doc.get("error") if isinstance(doc, dict) else None
+    if error:
+        return None, f"上一轮失败:{str(error)[:200]}"
+    generated_at = doc.get("generated_at") if isinstance(doc, dict) else None
     if not isinstance(generated_at, str) or not generated_at:
         return None, "manifest 里没有 generated_at"
     try:
@@ -115,7 +124,11 @@ def _apprise_notify(title: str, body: str) -> bool:
         import apprise  # 惰性:仅 env 非空才 import(同引擎约束 5)
         ap = apprise.Apprise()
         for url in urls:
-            ap.add(url)
+            if not ap.add(url):
+                # 评审 K:URL 写错时打一条脱敏 stderr(scheme=…),不再静默吞
+                scheme = url.split(":", 1)[0]
+                print(f"[check_freshness] apprise add 失败,跳过该 URL"
+                      f"(scheme={scheme};URL 写错或插件未装)", file=sys.stderr)
         return bool(ap.notify(title=title, body=body))
     except Exception as e:
         print(f"[check_freshness] apprise 推送失败:{e!r}(装了吗?"

@@ -72,8 +72,9 @@ class MemoryBudgetExceeded(RuntimeError):
 
 
 class ScanUnitsError(RuntimeError):
-    """scan 阶段永久性失败:引擎镜像太旧(require_scan_engine)、
-    单元行缺 verdict(extract_fields)。"""
+    """scan 阶段永久性失败:引擎镜像太旧(require_scan_engine)、单元行缺
+    verdict,或缺 confidence / first_hand_source_count(引擎镜像早于
+    #521,先重建镜像再跑)。"""
 
 
 def _current_rss_mb() -> float:

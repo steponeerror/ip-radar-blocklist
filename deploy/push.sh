@@ -17,6 +17,11 @@ if touch "$LOG_FILE" 2>/dev/null; then
     # systemd journal 两路照收;测试面按 stdout/stderr 断言的旧用例不破)。
     exec > >(tee -a "$LOG_FILE")
     exec 2> >(tee -a "$LOG_FILE" >&2)
+    # systemd 下 bash 不等进程替换结束就退出,主进程一退 unit 清 cgroup
+    # 残余(两个 tee),最后几行——恰是失败时的报错行——可能丢。等一秒
+    # 让 tee 把管道收完(评审 F 选的最小改法;部署后手工看一眼日志末行
+    # 是不是结束行,见 PR 正文)。
+    trap 'sleep 1' EXIT
 else
     echo "[push.sh] 日志文件 $LOG_FILE 不可写,输出只进 stdout/stderr(#461)" >&2
 fi
