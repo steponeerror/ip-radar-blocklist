@@ -99,9 +99,12 @@ def stub_env(tmp_path):
     env["CURL_LOG"] = str(log)
     env["BLOCKLIST_REPO_DIR"] = str(repo)
     env["BLOCKLIST_PUSH_TOKEN"] = TOKEN
+    # 发布日志(#461)也指到临时目录:所有用例都真跑 tee 落盘路径,不在
+    # 测试机上碰 /var/log。
+    env["BLOCKLIST_LOG"] = str(tmp_path / "push.log")
     env.pop("RELEASE_DATE", None)
     env.pop("STUB_MODE", None)
-    return {"env": env, "log": log}
+    return {"env": env, "log": log, "push_log": tmp_path / "push.log"}
 
 
 def _run(env, *args):
@@ -219,3 +222,32 @@ def test_upload_500_reports_code_and_message(stub_env):
     assert r.returncode == 1
     assert "HTTP 500" in r.stderr
     assert "Boom" in r.stderr   # 接口 message 字段也带出来(#449 新行为)
+
+
+# ---------------------------------------------------------------- 发布日志(#461)
+
+def test_output_lands_in_log_file_and_exit_code_unchanged(stub_env):
+    """stdout+stderr 同时追加进日志文件,退出码不变(#461 验收:失败路径
+    的报错行在日志里找得到;成功路径退出码 0)。"""
+    # 成功路径:退出码 0,日志里有上传行
+    r = _run(stub_env["env"])
+    assert r.returncode == 0, r.stderr
+    log = stub_env["push_log"].read_text(encoding="utf-8")
+    assert "Release v" in log and "uploaded: top_100.txt" in log
+    # 失败路径:退出码仍 1,报错行落在日志里(journald 轮转掉也找得回)
+    env = dict(stub_env["env"])
+    env["STUB_MODE"] = "create_403"
+    r = _run(env)
+    assert r.returncode == 1
+    log = stub_env["push_log"].read_text(encoding="utf-8")
+    assert "HTTP 403" in log and "Resource not accessible" in log
+
+
+def test_unwritable_log_file_does_not_block_publish(stub_env):
+    """日志文件写不了(目录不存在且建不出)→ 告警一行,发布照常、退出码不变。"""
+    env = dict(stub_env["env"])
+    # /proc 下不可建文件,touch 必败且与测试机权限无关
+    env["BLOCKLIST_LOG"] = "/proc/definitely/not/writable/push.log"
+    r = _run(env)
+    assert r.returncode == 0, r.stderr
+    assert "不可写" in r.stderr

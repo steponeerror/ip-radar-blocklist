@@ -25,7 +25,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))      # scripts/ as namespace pkg portion
 
-ENGINE_BACKEND = Path("/home/huxiao/dev/pi-ip-lookup-tool/backend")
+# 引擎 backend 路径:默认主检出;可用 IP_RADAR_ENGINE_BACKEND 指到别的
+# 检出/工作树(#521 实现期用 .worktrees/arch4-521,让集成测试跑在带
+# first_hand_source_count 的新字段上)。
+ENGINE_BACKEND = Path(os.environ.get(
+    "IP_RADAR_ENGINE_BACKEND", "/home/huxiao/dev/pi-ip-lookup-tool/backend"))
 ASOF = 1765000000.0                        # 与本机整轮试跑同一判定时刻
 
 # 全 12 列建表(CLI 先建 5 列再 ALTER 7 列共识列之后的形态;列序同

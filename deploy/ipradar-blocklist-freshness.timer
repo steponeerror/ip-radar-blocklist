@@ -1,0 +1,15 @@
+# 断更告警触发器(#448):每日 23:30 UTC(北京 07:30)。
+# 导出轮 21:00 UTC 起跑、约 1.7–2 小时,这个点在每轮预计完成之后;
+# 服务器 CET 23:30,与 ops-cron 4/12/20 点和 blocklist 21:00 UTC 起跑段不撞。
+# Persistent=true:停机跨过触发点,开机补跑一次。
+
+[Unit]
+Description=Nightly trigger for ipradar-blocklist freshness alert
+
+[Timer]
+OnCalendar=*-*-* 23:30:00 UTC
+Persistent=true
+Unit=ipradar-blocklist-freshness.service
+
+[Install]
+WantedBy=timers.target

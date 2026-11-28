@@ -37,8 +37,11 @@ ip,asn,country,classes,confidence,source_count,first_seen,last_seen
 
 - `ip` — single IP (v4 or v6); CIDR units are counted in the manifest but excluded from tiers
 - `classes` — threat categories (`;`-joined, e.g. `brute-force;scanner`)
-- `confidence` — engine consensus confidence, 0–100
-- `source_count` — how many independent sources flagged it
+- `confidence` — engine fused consensus confidence (`threat.confidence`, the
+  same number the web UI shows; #521)
+- `source_count` — first-hand accusing sources (engine's
+  `first_hand_source_count`: distinct sources accusing, derived aggregators
+  that republish other feeds excluded; #521)
 - `first_seen` / `last_seen` — earliest / latest observation across sources (may be empty)
 
 Entries are ranked by **source_count ↓, confidence ↓, recency ↓** — the top of
